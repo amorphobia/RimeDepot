@@ -11,6 +11,7 @@
 #SingleInstance Off
 
 #Include ..\RimeDepot.ahk
+#Include ..\RimeDepotGui.ahk
 
 try {
     RimeDepotCoreProbeMain()
@@ -24,6 +25,7 @@ RimeDepotCoreProbeMain() {
     RimeDepotCoreProbeTest("YAML", RimeDepotCoreProbeYaml.Bind())
     RimeDepotCoreProbeTest("target and security", RimeDepotCoreProbeTarget.Bind())
     RimeDepotCoreProbeTest("config precedence", RimeDepotCoreProbeConfig.Bind())
+    RimeDepotCoreProbeTest("GUI settings INI round-trip", RimeDepotCoreProbeGuiSettings.Bind())
     RimeDepotCoreProbeTest("catalog async and cache fallback", RimeDepotCoreProbeCatalog.Bind())
     RimeDepotCoreProbeTest("official RPPI categories and recipes", RimeDepotCoreProbeOfficialRppi.Bind())
     RimeDepotCoreProbeTest("git safety", RimeDepotCoreProbeGit.Bind())
@@ -98,7 +100,59 @@ RimeDepotCoreProbeConfig() {
     }
 }
 
+RimeDepotCoreProbeGuiSettings() {
+    local root, cache_path, rime_path, settings_path, url, values, service, gui, loaded, result
+    root := A_Temp . "\RimeDepotGuiSettings-" . A_TickCount . "-"
+        . DllCall("GetCurrentProcessId", "UInt") . "-" . Random(100000, 999999)
+    cache_path := root . "\cache"
+    rime_path := root . "\rime"
+    settings_path := root . "\settings.ini"
+    url := "https://example.invalid/index.json"
+    values := Map(
+        "CachePath", cache_path,
+        "RimeDirectory", rime_path,
+        "RppiIndexUrl", url,
+        "Proxy", "http://127.0.0.1:7890",
+        "UseGit", true,
+        "GitPath", "C:\Tools\git.exe"
+    )
+    gui := 0
+    try {
+        service := RimeDepotService(Map(
+            "CachePath", cache_path,
+            "RimeDirectory", rime_path,
+            "RppiIndexUrl", url
+        ), "", Map("Http", RimeDepotCoreProbeTransport(Map())))
+        gui := RimeDepotGui(service, RimeDepotGuiSettings(values), settings_path)
+        ; Invoke the same bound callback installed on the Save button, without
+        ; showing a window or dispatching a native click.
+        RimeDepotCoreProbeAssert(gui.save_settings_button.OnEvent,
+            "GUI Save button was not created.")
+        result := gui.SaveSettings.Bind(gui).Call(gui.save_settings_button, 0)
+        RimeDepotCoreProbeAssert(result, "GUI Save button callback failed: " . gui.status_text.Value)
+        loaded := RimeDepotGuiSettings.Load(settings_path)
+        RimeDepotCoreProbeAssert(loaded.cache_path = cache_path
+            && loaded.rime_directory = rime_path
+            && loaded.rppi_index_url = url
+            && loaded.proxy = values["Proxy"]
+            && loaded.use_git
+            && loaded.git_path = values["GitPath"],
+            "GUI Save button did not round-trip all six settings fields.")
+    } finally {
+        if IsObject(gui) {
+            try gui.Dispose()
+        }
+        if FileExist(settings_path) {
+            try FileDelete(settings_path)
+        }
+        if DirExist(root) {
+            try RimeDepotUtil.DeleteTree(root)
+        }
+    }
+}
+
 RimeDepotCoreProbeCatalog() {
+    local loaded_count, fallback_count
     cache_path := A_Temp . "\\RimeDepotCoreProbe-cache-" . A_TickCount
     root_url := "https://example.invalid/index.json"
     child_url := "https://example.invalid/child.json"
@@ -118,6 +172,7 @@ RimeDepotCoreProbeCatalog() {
         RimeDepotCoreProbeAssert(job.Status = "completed", "Catalog load did not complete (status=" . job.Status . ", error=" . error_text . ").")
         RimeDepotCoreProbeAssert(service.GetEntry("foo").Dependencies.Length = 1, "Catalog dependency was not loaded.")
         RimeDepotCoreProbeAssert(service.GetEntry("child").Repo = "owner/child", "Linked catalog was not loaded.")
+        loaded_count := service.Catalog.ToArray().Length
 
         fallback_transport := RimeDepotCoreProbeTransport(Map(
             root_url, RimeDepotHttpResponse(root_url, 0, "", Map(), Error("offline")),
@@ -129,6 +184,12 @@ RimeDepotCoreProbeCatalog() {
         RimeDepotCoreProbeWait(fallback_job)
         RimeDepotCoreProbeAssert(fallback_job.Status = "completed", "Cached catalog fallback did not complete.")
         RimeDepotCoreProbeAssert(fallback_service.Catalog.Warnings.Length > 0, "Stale cache warning was not recorded.")
+        fallback_count := fallback_service.Catalog.ToArray().Length
+        RimeDepotCoreProbeAssert(fallback_count = loaded_count
+            && fallback_service.GetEntry("foo").Dependencies.Length = 1
+            && fallback_service.GetEntry("bar").Repo = "owner/bar"
+            && fallback_service.GetEntry("child").Repo = "owner/child",
+            "Cached catalog fallback changed the complete fixture entry set.")
     } finally {
         if DirExist(cache_path) {
             RimeDepotUtil.DeleteTree(cache_path)
@@ -500,26 +561,26 @@ RimeDepotCoreProbeCacheIntegrity() {
 
 RimeDepotCoreProbeHttpLifecycle() {
     local client, outcome, request, request2, request3, calls_after_fail, calls_after_cancel
+    local poll_request, poll_fake, poll_outcome, error_request, error_fake, error_outcome
+    local cancel_request, cancel_fake, cancel_outcome
     client := RimeDepotHttpClient()
     outcome := RimeDepotCoreProbeOutcome()
 
     request := RimeDepotHttpRequest(client, "https://example.invalid/complete", ObjBindMethod(outcome, "Http"))
     request.Request := Map("fake", true)
-    request.Sink := Map("connected", true)
     client._requests[request.Id] := request
     request._Complete(RimeDepotHttpResponse(request.Url, 200, "ok", Map()))
-    RimeDepotCoreProbeAssert(request.Status = "completed" && !request.Sink,
-        "Completed HTTP request did not release its event sink.")
+    RimeDepotCoreProbeAssert(request.Status = "completed",
+        "Completed HTTP request did not reach its terminal state.")
     RimeDepotCoreProbeAssert(!client._requests.Has(request.Id) && outcome.Calls = 1,
         "Completed HTTP request was not forgotten or delivered once.")
 
     request2 := RimeDepotHttpRequest(client, "https://example.invalid/fail", ObjBindMethod(outcome, "Http"))
     request2.Request := Map("fake", true)
-    request2.Sink := Map("connected", true)
     client._requests[request2.Id] := request2
     request2.Fail(Error("fixture failure"))
-    RimeDepotCoreProbeAssert(request2.Status = "failed" && !request2.Sink && !client._requests.Has(request2.Id),
-        "Failed HTTP request did not release its event sink.")
+    RimeDepotCoreProbeAssert(request2.Status = "failed" && !client._requests.Has(request2.Id),
+        "Failed HTTP request did not reach terminal cleanup.")
     calls_after_fail := outcome.Calls
     request2._Complete(RimeDepotHttpResponse(request2.Url, 200, "late", Map()))
     RimeDepotCoreProbeAssert(outcome.Calls = calls_after_fail,
@@ -527,15 +588,72 @@ RimeDepotCoreProbeHttpLifecycle() {
 
     request3 := RimeDepotHttpRequest(client, "https://example.invalid/cancel", ObjBindMethod(outcome, "Http"))
     request3.Request := Map("fake", true)
-    request3.Sink := Map("connected", true)
     client._requests[request3.Id] := request3
     RimeDepotCoreProbeAssert(request3.Cancel(), "HTTP cancellation was not accepted.")
-    RimeDepotCoreProbeAssert(request3.Status = "cancelled" && !request3.Sink && !client._requests.Has(request3.Id),
-        "Cancelled HTTP request did not release its event sink.")
+    RimeDepotCoreProbeAssert(request3.Status = "cancelled" && !client._requests.Has(request3.Id),
+        "Cancelled HTTP request did not reach terminal cleanup.")
     calls_after_cancel := outcome.Calls
     request3._Complete(RimeDepotHttpResponse(request3.Url, 200, "late", Map()))
     RimeDepotCoreProbeAssert(outcome.Calls = calls_after_cancel,
         "A late HTTP completion invoked a cancelled request callback.")
+
+    ; The production request path uses non-blocking WaitForResponse(0)
+    ; polling.  Exercise pending -> complete transitions and timer cleanup
+    ; without creating a WinHTTP object or any callback connection.
+    poll_outcome := RimeDepotCoreProbeOutcome()
+    poll_request := RimeDepotHttpRequest(client, "https://example.invalid/poll",
+        ObjBindMethod(poll_outcome, "Http"))
+    poll_fake := RimeDepotCoreProbeHttpPollRequest([false, true], 200, "polled", "X-Test: ok`r`n")
+    poll_request.Request := poll_fake
+    poll_request.Status := "running"
+    poll_request._start_tick := A_TickCount
+    poll_request._timeout := 5000
+    poll_request._timer_active := true
+    client._requests[poll_request.Id] := poll_request
+    poll_request._Poll()
+    RimeDepotCoreProbeAssert(poll_fake.WaitCalls = 1 && poll_request.Status = "running"
+        && poll_request._timer_active, "HTTP polling did not retain a pending request.")
+    poll_request._Poll()
+    RimeDepotCoreProbeAssert(poll_request.Status = "completed" && !poll_request._timer_active
+        && poll_outcome.Calls = 1 && poll_outcome.Success && poll_outcome.Value.Body = "polled",
+        "HTTP polling did not complete and release its timer.")
+    poll_request._Poll()
+    RimeDepotCoreProbeAssert(poll_outcome.Calls = 1, "A late HTTP poll delivered twice.")
+
+    error_outcome := RimeDepotCoreProbeOutcome()
+    error_request := RimeDepotHttpRequest(client, "https://example.invalid/poll-error",
+        ObjBindMethod(error_outcome, "Http"))
+    error_fake := RimeDepotCoreProbeHttpPollRequest([Error("poll fixture failure")])
+    error_request.Request := error_fake
+    error_request.Status := "running"
+    error_request._start_tick := A_TickCount
+    error_request._timeout := 5000
+    error_request._timer_active := true
+    client._requests[error_request.Id] := error_request
+    error_request._Poll()
+    RimeDepotCoreProbeAssert(error_request.Status = "failed" && !error_request._timer_active
+        && error_outcome.Calls = 1 && !error_outcome.Success,
+        "HTTP polling error did not complete exactly once.")
+    error_request._Poll()
+    RimeDepotCoreProbeAssert(error_outcome.Calls = 1, "A late failed HTTP poll delivered twice.")
+
+    cancel_outcome := RimeDepotCoreProbeOutcome()
+    cancel_request := RimeDepotHttpRequest(client, "https://example.invalid/poll-cancel",
+        ObjBindMethod(cancel_outcome, "Http"))
+    cancel_fake := RimeDepotCoreProbeHttpPollRequest([false])
+    cancel_request.Request := cancel_fake
+    cancel_request.Status := "running"
+    cancel_request._start_tick := A_TickCount
+    cancel_request._timeout := 5000
+    cancel_request._timer_active := true
+    client._requests[cancel_request.Id] := cancel_request
+    RimeDepotCoreProbeAssert(cancel_request.Cancel(), "HTTP polling cancellation was not accepted.")
+    RimeDepotCoreProbeAssert(cancel_fake.AbortCalls = 1 && cancel_request.Status = "cancelled"
+        && !cancel_request._timer_active && cancel_outcome.Calls = 0
+        && !client._requests.Has(cancel_request.Id),
+        "HTTP polling cancellation did not abort and clean up its timer.")
+    cancel_request._Poll()
+    RimeDepotCoreProbeAssert(cancel_outcome.Calls = 0, "A late cancelled HTTP poll delivered a callback.")
 }
 
 RimeDepotCoreProbeWait(job) {
@@ -756,5 +874,38 @@ class RimeDepotCoreProbeCacheWriter {
             throw Error("simulated metadata commit failure")
         }
         RimeDepotUtil.AtomicWrite(path, content)
+    }
+}
+
+class RimeDepotCoreProbeHttpPollRequest {
+    __New(results, status := 200, body := "ok", headers := "") {
+        this.Results := results
+        this.Status := status
+        this.ResponseText := body
+        this.ResponseBody := body
+        this.Headers := headers
+        this.WaitCalls := 0
+        this.AbortCalls := 0
+    }
+
+    WaitForResponse(timeout) {
+        local result
+        this.WaitCalls += 1
+        if !this.Results.Length {
+            return true
+        }
+        result := this.Results.RemoveAt(1)
+        if IsObject(result) {
+            throw result
+        }
+        return !!result
+    }
+
+    GetAllResponseHeaders() {
+        return this.Headers
+    }
+
+    Abort() {
+        this.AbortCalls += 1
     }
 }

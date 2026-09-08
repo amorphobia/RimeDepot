@@ -114,7 +114,7 @@ class RimeDepotGuiSettings {
         if directory && !DirExist(directory) {
             DirCreate(directory)
         }
-        for key in this.KEYS {
+        for key in RimeDepotGuiSettings.KEYS {
             switch key {
                 case "CachePath": value := this.cache_path
                 case "RimeDirectory": value := this.rime_directory
@@ -123,7 +123,7 @@ class RimeDepotGuiSettings {
                 case "UseGit": value := this.use_git ? "1" : "0"
                 case "GitPath": value := this.git_path
             }
-            IniWrite(value, path, this.SECTION, key)
+            IniWrite(value, path, RimeDepotGuiSettings.SECTION, key)
         }
     }
 }

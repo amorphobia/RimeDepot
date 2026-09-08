@@ -39,9 +39,9 @@ class RimeDepotHttpResponse {
 }
 
 /**
- * WinHTTP request wrapper.  WinHTTP is opened in asynchronous mode and the
- * completion event is delivered to the supplied callback, so no network
- * operation blocks a GUI message loop.
+ * WinHTTP request wrapper.  WinHTTP is opened in asynchronous mode and a
+ * short SetTimer polls WaitForResponse(0), so Start never blocks the GUI
+ * message loop and completion is delivered to the supplied callback.
  */
 class RimeDepotHttpClient {
     __New(transport := 0) {
@@ -108,9 +108,12 @@ class RimeDepotHttpRequest {
         this.Id := RimeDepotUtil.NextId()
         this.Status := "pending"
         this.Request := 0
-        this.Sink := 0
         this.Response := 0
         this._completed := false
+        this._poll_timer := ObjBindMethod(this, "_Poll")
+        this._timer_active := false
+        this._start_tick := 0
+        this._timeout := 30000
     }
 
     Start() {
@@ -118,8 +121,6 @@ class RimeDepotHttpRequest {
             return this
         }
         this.Request := ComObject("WinHttp.WinHttpRequest.5.1")
-        this.Sink := RimeDepotHttpEventSink(this)
-        ComObjConnect(this.Request, this.Sink)
         this.Request.Open("GET", this.Url, true)
 
         proxy := RimeDepotUtil.GetString(this.Options, ["Proxy", "proxy"], "")
@@ -132,6 +133,7 @@ class RimeDepotHttpRequest {
             this.Request.SetProxy(0)
         }
         timeout := RimeDepotUtil.GetValue(this.Options, ["Timeout", "timeout"], 30000)
+        this._timeout := timeout
         try this.Request.SetTimeouts(timeout, timeout, timeout, timeout)
 
         headers := RimeDepotUtil.GetValue(this.Options, ["Headers", "headers"], 0)
@@ -141,7 +143,9 @@ class RimeDepotHttpRequest {
             }
         }
         this.Status := "running"
+        this._start_tick := A_TickCount
         this.Request.Send()
+        this._StartPollTimer()
         return this
     }
 
@@ -149,40 +153,57 @@ class RimeDepotHttpRequest {
         if this._completed {
             return false
         }
+        this._completed := true
+        this.Status := "cancelled"
+        this._StopPollTimer()
         try {
             if this.Request {
                 this.Request.Abort()
             }
         }
-        this._completed := true
-        this.Status := "cancelled"
-        this._Disconnect()
         this.Client._Forget(this)
         return true
     }
 
-    OnResponseFinished(request, error := 0) {
-        if this._completed {
+    _StartPollTimer() {
+        if this._completed || this._timer_active {
             return
         }
-        if error {
-            this.Fail(Error("WinHTTP asynchronous request failed (" . error . ")."))
+        this._timer_active := true
+        SetTimer(this._poll_timer, 25)
+    }
+
+    _StopPollTimer() {
+        if !this._timer_active {
+            return
+        }
+        SetTimer(this._poll_timer, 0)
+        this._timer_active := false
+    }
+
+    _Poll(*) {
+        local status, binary, body, headers
+        if this._completed {
+            this._StopPollTimer()
             return
         }
         try {
-            status := request.Status
+            if !this.Request.WaitForResponse(0) {
+                if this._timeout > 0 && A_TickCount - this._start_tick >= this._timeout {
+                    try this.Request.Abort()
+                    this.Fail(Error("WinHTTP request timed out."))
+                }
+                return
+            }
+            ; WaitForResponse(0) is non-blocking.  Only inspect response
+            ; properties after WinHTTP reports that the async request is done.
+            status := this.Request.Status
             binary := RimeDepotUtil.GetValue(this.Options, ["Binary", "binary"], false)
-            body := binary ? request.ResponseBody : request.ResponseText
-            headers := this._ParseHeaders(request.GetAllResponseHeaders())
+            body := binary ? this.Request.ResponseBody : this.Request.ResponseText
+            headers := this._ParseHeaders(this.Request.GetAllResponseHeaders())
             this._Complete(RimeDepotHttpResponse(this.Url, status, body, headers))
         } catch as err {
             this.Fail(err)
-        }
-    }
-
-    OnError(error := 0) {
-        if !this._completed {
-            this.Fail(IsObject(error) ? error : Error("WinHTTP request error: " . error))
         }
     }
 
@@ -199,8 +220,8 @@ class RimeDepotHttpRequest {
         }
         this._completed := true
         this.Status := response.Error ? "failed" : "completed"
+        this._StopPollTimer()
         this.Response := response
-        this._Disconnect()
         this.Client._Forget(this)
         if this.Callback {
             try {
@@ -209,14 +230,6 @@ class RimeDepotHttpRequest {
                 OutputDebug("RimeDepot HTTP callback failed: " . err.Message)
             }
         }
-    }
-
-    _Disconnect() {
-        if this.Request && this.Sink {
-            ; Omitting the event object disconnects the active event sink.
-            try ComObjConnect(this.Request)
-        }
-        this.Sink := 0
     }
 
     _ParseHeaders(value) {
@@ -228,20 +241,6 @@ class RimeDepotHttpRequest {
             }
         }
         return result
-    }
-}
-
-class RimeDepotHttpEventSink {
-    __New(request) {
-        this.Request := request
-    }
-
-    OnResponseFinished(request, error := 0) {
-        this.Request.OnResponseFinished(request, error)
-    }
-
-    OnError(error := 0) {
-        this.Request.OnError(error)
     }
 }
 
