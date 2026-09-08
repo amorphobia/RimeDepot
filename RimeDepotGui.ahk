@@ -138,7 +138,11 @@ class RimeDepotGuiSettings {
  */
 class RimeDepotGui extends Gui {
     static WINDOW_WIDTH := 1080
-    static WINDOW_HEIGHT := 760
+    static RPPI_HEIGHT := 760
+    static DIRECT_HEIGHT := 420
+    ; Keep the old name as a compatibility alias for small hosts which used
+    ; the original fixed-height constant.  Show() now chooses by mode.
+    static WINDOW_HEIGHT := RimeDepotGui.RPPI_HEIGHT
 
     __New(service, settings := 0, settings_path := "") {
         if settings is String && settings_path = "" {
@@ -146,7 +150,7 @@ class RimeDepotGui extends Gui {
             settings := 0
         }
         local initial_settings := settings ? settings : RimeDepotGuiSettings()
-        super.__New("+MinSize800x620", "RimeDepot — Rime package catalog")
+        super.__New("+MinSize800x420", "RimeDepot — Rime package catalog")
         this.service := service
         this.settings := initial_settings is RimeDepotGuiSettings
             ? initial_settings
@@ -159,8 +163,11 @@ class RimeDepotGui extends Gui {
         this.operation_token := 0
         this.catalog_entries := []
         this.visible_entries := Map()
+        this.category_paths := [""]
         this.busy := false
         this.disposed := false
+        this._shown := false
+        this._hidden := false
         this.initial_load_started := false
         this.initial_load_callback := this.StartInitialLoad.Bind(this)
         this.progress_callback := 0
@@ -208,7 +215,7 @@ class RimeDepotGui extends Gui {
         this.save_settings_button.OnEvent("Click", this.SaveSettings.Bind(this))
 
         this.mode_label := this.AddText("x28 y150 w76 h24 +0x200", "Mode")
-        this.mode_selector := this.AddDropDownList("x110 y146 w210 h26 Choose1", ["RPPI catalog", "Direct install"])
+        this.mode_selector := this.AddDropDownList("x110 y146 w210 R2 Choose1", ["RPPI catalog", "Direct install"])
         this.mode_selector.OnEvent("Change", this.OnModeChanged.Bind(this))
         this.mode_dropdown := this.mode_selector
 
@@ -216,7 +223,7 @@ class RimeDepotGui extends Gui {
         this.search_edit := this.AddEdit("x78 y194 w280 h26")
         this.search_edit.OnEvent("Change", this.OnFilterChanged.Bind(this))
         this.category_label := this.AddText("x378 y198 w66 h24 +0x200", "Category")
-        this.category_filter := this.AddDropDownList("x448 y194 w210 h26 Choose1", ["All categories"])
+        this.category_filter := this.AddDropDownList("x448 y194 w210 R10 Choose1", ["All categories"])
         this.category_filter.OnEvent("Change", this.OnFilterChanged.Bind(this))
         this.refresh_button := this.AddButton("x774 y194 w94 h28 +0x2000", "Refresh index")
         this.refresh_button.OnEvent("Click", this.RefreshCatalog.Bind(this))
@@ -247,20 +254,20 @@ class RimeDepotGui extends Gui {
         this.detail_labels := this.AddText("x28 y656 w760 h22", "Labels: ")
         this.detail_license := this.AddText("x802 y656 w236 h22", "License: ")
 
-        this.direct_group := this.AddGroupBox("x12 y184 w1056 h154", "Direct source")
-        this.direct_source_label := this.AddText("x22 y198 w54 h24 +0x200", "Source")
-        this.direct_source_edit := this.AddEdit("x78 y194 w780 h26")
+        this.direct_group := this.AddGroupBox("x12 y184 w1056 h176", "Direct source")
+        this.direct_source_label := this.AddText("x22 y214 w54 h24 +0x200", "Source")
+        this.direct_source_edit := this.AddEdit("x78 y210 w780 h26")
         this.direct_source_edit.OnEvent("Change", this.OnDirectInputChanged.Bind(this))
-        this.direct_ref_kind_label := this.AddText("x22 y238 w54 h24 +0x200", "Ref kind")
+        this.direct_ref_kind_label := this.AddText("x22 y254 w54 h24 +0x200", "Ref kind")
         this.direct_ref_kind := this.AddDropDownList(
-            "x78 y234 w180 h26 Choose1", ["Default", "Branch", "Tag", "Commit SHA"]
+            "x78 y250 w180 R4 Choose1", ["Default", "Branch", "Tag", "Commit SHA"]
         )
-        this.direct_ref_label := this.AddText("x270 y238 w54 h24 +0x200", "Ref")
-        this.direct_ref_edit := this.AddEdit("x330 y234 w528 h26")
-        this.direct_recipe_label := this.AddText("x22 y278 w54 h24 +0x200", "Recipe")
-        this.direct_recipe_edit := this.AddEdit("x78 y274 w780 h26")
+        this.direct_ref_label := this.AddText("x270 y254 w54 h24 +0x200", "Ref")
+        this.direct_ref_edit := this.AddEdit("x330 y250 w528 h26")
+        this.direct_recipe_label := this.AddText("x22 y294 w54 h24 +0x200", "Recipe")
+        this.direct_recipe_edit := this.AddEdit("x78 y290 w780 h26")
         this.direct_recipe_hint := this.AddText(
-            "x22 y306 w1034 h24 cGray", "Leave Recipe empty to use the repository root recipe.yaml automatically."
+            "x22 y322 w1034 h24 cGray", "Leave Recipe empty to use the repository root recipe.yaml automatically."
         )
         ; Keep both names available to small hosts and hidden GUI tests: the
         ; field is a repository source, which may also be an explicit .zip URL.
@@ -277,6 +284,9 @@ class RimeDepotGui extends Gui {
             this.detail_summary, this.detail_schemas, this.detail_dependencies,
             this.detail_reverse_dependencies, this.detail_labels, this.detail_license
         ]
+        this.rppi_interactive_controls := [
+            this.search_edit, this.category_filter, this.refresh_button, this.catalog_list
+        ]
         this.direct_controls := [
             this.direct_group, this.direct_source_label, this.direct_source_edit,
             this.direct_ref_kind_label, this.direct_ref_kind, this.direct_ref_label,
@@ -290,11 +300,35 @@ class RimeDepotGui extends Gui {
     }
 
     Show(options := "") {
-        super.Show(Trim(options . Format(" w{} h{}", RimeDepotGui.WINDOW_WIDTH, RimeDepotGui.WINDOW_HEIGHT)))
+        local show_options := Trim(String(options))
+        local hidden := !!RegExMatch(show_options, "i)(^|[ \t])Hide($|[ \t])")
+        local has_width := !!RegExMatch(show_options, "i)(^|[ \t])w(?:idth)?\s*[-+]?\d")
+        local has_height := !!RegExMatch(show_options, "i)(^|[ \t])h(?:eight)?\s*[-+]?\d")
+        if !has_width && !this._shown {
+            show_options .= (show_options = "" ? "" : " ") . "w" . RimeDepotGui.WINDOW_WIDTH
+        }
+        if !has_height {
+            show_options .= (show_options = "" ? "" : " ") . "h" . this.ModeWindowHeight()
+        }
+        this._shown := true
+        this._hidden := hidden
+        super.Show(show_options)
+        if !hidden {
+            this._hidden := false
+        }
         if !this.initial_load_started {
             this.initial_load_started := true
             SetTimer(this.initial_load_callback, -1)
         }
+    }
+
+    Hide() {
+        this._hidden := true
+        return super.Hide()
+    }
+
+    ModeWindowHeight() {
+        return this.mode = "direct" ? RimeDepotGui.DIRECT_HEIGHT : RimeDepotGui.RPPI_HEIGHT
     }
 
     StartInitialLoad(*) {
@@ -415,6 +449,7 @@ class RimeDepotGui extends Gui {
         for _, control in this.direct_controls {
             control.Visible := direct
         }
+        this.ApplyModeLayout(direct)
         this.install_button.Text := direct ? "Install direct" : "Install"
         if direct {
             this.install_button.Enabled := !this.busy && Trim(this.direct_source_edit.Value) != ""
@@ -423,6 +458,18 @@ class RimeDepotGui extends Gui {
         }
         this.UpdateGitPathState()
         return true
+    }
+
+    ApplyModeLayout(direct) {
+        local action_y := direct ? 210 : 194, status_y := direct ? 374 : 692
+        this.install_button.Move(876, action_y, 94, 28)
+        this.cancel_button.Move(978, action_y, 78, 28)
+        this.status_text.Move(22, status_y, 700, 22)
+        this.progress_bar.Move(730, status_y + 2, 328, 18)
+        if this._shown {
+            local hidden_options := this._hidden ? "Hide " : ""
+            super.Show(Trim(hidden_options . Format("h{}", this.ModeWindowHeight())))
+        }
     }
 
     SyncCatalogSelection() {
@@ -609,7 +656,13 @@ class RimeDepotGui extends Gui {
             } else {
                 throw Error("The active RimeDepotJob cannot be cancelled.")
             }
-            this.SetStatus("Cancellation requested…")
+            ; A cancellation implementation may synchronously report its
+            ; terminal error/complete callback.  Do not overwrite that final
+            ; state with a pending message after the callback has released
+            ; the active job.
+            if this.busy && IsObject(this.active_job) && this.active_job = job && (!HasMethod(job, "IsDone") || !job.IsDone()) {
+                this.SetStatus("Cancellation requested…")
+            }
             return true
         } catch as err {
             this.SetStatus("Could not cancel operation: " . RimeDepotGuiErrorText(err), true)
@@ -728,10 +781,12 @@ class RimeDepotGui extends Gui {
         this.use_git_checkbox.Enabled := enabled
         this.mode_selector.Enabled := enabled
         this.save_settings_button.Enabled := enabled
-        this.refresh_button.Enabled := enabled
         this.install_button.Enabled := enabled && (this.mode = "direct"
             ? Trim(this.direct_source_edit.Value) != "" : this.catalog_list.GetNext(0) > 0)
         this.cancel_button.Enabled := !!busy
+        for _, control in this.rppi_interactive_controls {
+            control.Enabled := enabled
+        }
         for _, control in this.direct_controls {
             control.Enabled := enabled
         }
@@ -739,50 +794,129 @@ class RimeDepotGui extends Gui {
     }
 
     OnFilterChanged(*) {
-        if !this.disposed {
+        if !this.disposed && !this.busy {
             this.RefreshCatalogView()
         }
     }
 
+    SelectedCategoryPath() {
+        local index := this.category_filter.Value
+        if index < 1 || index > this.category_paths.Length {
+            return ""
+        }
+        return this.category_paths[index]
+    }
+
+    CanonicalCategoryPath(value) {
+        local parts, canonical := "", part
+        value := Trim(String(value))
+        if value = "" {
+            return "Uncategorized"
+        }
+        parts := StrSplit(value, " / ")
+        for _, part in parts {
+            part := Trim(part)
+            if part = "" {
+                continue
+            }
+            canonical := canonical = "" ? part : canonical . " / " . part
+        }
+        return canonical = "" ? "Uncategorized" : canonical
+    }
+
+    CategoryPathForEntry(entry) {
+        return this.CanonicalCategoryPath(RimeDepotGuiEntryText(
+            entry,
+            ["category_path", "CategoryPath", "category", "Category"],
+            "Uncategorized"
+        ))
+    }
+
+    CategoryLeafName(path) {
+        local parts := StrSplit(path, " / ")
+        return parts[parts.Length]
+    }
+
+    CategoryParentPath(path) {
+        local parts := StrSplit(path, " / "), parent := "", index
+        if parts.Length <= 1 {
+            return ""
+        }
+        Loop parts.Length - 1 {
+            index := A_Index
+            parent := parent = "" ? parts[index] : parent . " / " . parts[index]
+        }
+        return parent
+    }
+
+    CategoryDisplayText(path, leaf_counts := 0) {
+        local parts := StrSplit(path, " / "), leaf := parts[parts.Length], indent := "", suffix
+        Loop parts.Length - 1 {
+            indent .= "    "
+        }
+        if path = "All categories" {
+            leaf .= " (category)"
+        } else if IsObject(leaf_counts) && leaf_counts.Has(leaf) && leaf_counts[leaf] > 1 {
+            suffix := this.CategoryParentPath(path)
+            leaf .= " (" . (suffix != "" ? suffix : "top level") . ")"
+        }
+        return indent . leaf
+    }
+
     UpdateCategoryFilter() {
-        local selected := this.category_filter.Text, categories := ["All categories"], seen := Map(), category, index
-        seen["All categories"] := true
+        local selected := this.SelectedCategoryPath()
+        local categories, paths := [""], seen := Map(), category, path, leaf
+        local parts, part, index, selected_index := 1, leaf_counts := Map()
+        seen[""] := true
         for entry in this.catalog_entries {
-            category := RimeDepotGuiEntryText(
-                entry,
-                ["category_path", "CategoryPath", "category", "Category"],
-                "Uncategorized"
-            )
-            if !seen.Has(category) {
-                seen[category] := true
-                categories.Push(category)
+            category := this.CategoryPathForEntry(entry)
+            parts := StrSplit(category, " / ")
+            path := ""
+            for _, part in parts {
+                path := path = "" ? part : path . " / " . part
+                if !seen.Has(path) {
+                    seen[path] := true
+                    paths.Push(path)
+                }
+            }
+        }
+        this.category_paths := paths
+        categories := ["All categories"]
+        for index, path in paths {
+            if index = 1 {
+                continue
+            }
+            leaf := this.CategoryLeafName(path)
+            leaf_counts[leaf] := leaf_counts.Has(leaf) ? leaf_counts[leaf] + 1 : 1
+        }
+        for index, path in paths {
+            if index > 1 {
+                categories.Push(this.CategoryDisplayText(path, leaf_counts))
             }
         }
         this.category_filter.Delete()
         this.category_filter.Add(categories)
-        index := 1
-        for index, category in categories {
-            if category = selected {
-                this.category_filter.Choose(index)
-                return
+        if selected != "" {
+            for index, path in paths {
+                if path = selected {
+                    selected_index := index
+                    break
+                }
             }
         }
-        this.category_filter.Choose(1)
+        this.category_filter.Choose(selected_index)
     }
 
     RefreshCatalogView(*) {
-        local query := StrLower(Trim(this.search_edit.Value)), category := this.category_filter.Text
+        local query := StrLower(Trim(this.search_edit.Value)), category := this.SelectedCategoryPath()
         local entry, row, values, name, entry_category
         this.catalog_list.Delete()
         this.visible_entries := Map()
         for entry in this.catalog_entries {
             name := RimeDepotGuiEntryText(entry, ["name"], "")
-            entry_category := RimeDepotGuiEntryText(
-                entry,
-                ["category_path", "CategoryPath", "category", "Category"],
-                "Uncategorized"
-            )
-            if category != "All categories" && entry_category != category {
+            entry_category := this.CategoryPathForEntry(entry)
+            if category != "" && entry_category != category
+                && SubStr(entry_category, 1, StrLen(category) + 3) != category . " / " {
                 continue
             }
             if query != "" && !InStr(StrLower(
@@ -817,11 +951,7 @@ class RimeDepotGui extends Gui {
     }
 
     ShowDetails(entry) {
-        local category := RimeDepotGuiEntryText(
-            entry,
-            ["category_path", "CategoryPath", "category", "Category"],
-            "Uncategorized"
-        )
+        local category := this.CategoryPathForEntry(entry)
         local name := RimeDepotGuiEntryText(entry, ["name", "Name"], "")
         local repo := RimeDepotGuiEntryText(entry, ["repo", "Repo", "repository", "Repository"], "")
         local branch := RimeDepotGuiEntryRef(entry)

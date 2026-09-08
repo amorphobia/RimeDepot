@@ -26,6 +26,10 @@ RimeDepotGuiSmokeMain() {
     RunTest("RimeDepot GUI handles synchronous catalog completion and error", RimeDepotGuiSmokeCatalogSynchronous.Bind())
     RunTest("RimeDepot GUI keeps details for the current selection", RimeDepotGuiSmokeSelection.Bind())
     RunTest("RimeDepot GUI switches RPPI and direct modes", RimeDepotGuiSmokeModes.Bind())
+    RunTest("RimeDepot GUI builds hierarchical category filters", RimeDepotGuiSmokeCategories.Bind())
+    RunTest("RimeDepot GUI disambiguates duplicate category leaves", RimeDepotGuiSmokeCategoryNames.Bind())
+    RunTest("RimeDepot GUI applies mode geometry and DDL row options", RimeDepotGuiSmokeGeometry.Bind())
+    RunTest("RimeDepot GUI preserves filter state while busy", RimeDepotGuiSmokeBusy.Bind())
     ExitApp(0)
 }
 
@@ -221,6 +225,281 @@ RimeDepotGuiSmokeModes() {
     }
 }
 
+RimeDepotGuiSmokeCategories() {
+    local gui := RimeDepotGui(RimeDepotGuiFakeService(), RimeDepotGuiSettings(),
+        A_Temp . "\\RimeDepot-GuiSmoke-categories.ini")
+    local entries := [
+        {category_path: "汉语 / 普通话", name: "Mandarin", repo: "owner/mandarin", schemas: ["mandarin.schema"],
+            dependencies: ["base"], reverseDependencies: [], labels: ["spoken"], license: "MIT"},
+        {category_path: "汉语 / 方言", name: "Dialect", repo: "owner/dialect", schemas: ["dialect.schema"],
+            dependencies: ["base"], reverseDependencies: [], labels: ["regional"], license: "MIT"},
+        {category_path: "英语", name: "English", repo: "owner/english", schemas: ["english.schema"],
+            dependencies: [], reverseDependencies: [], labels: ["latin"], license: "MIT"},
+        {category_path: "汉语拼音", name: "Pinyin", repo: "owner/pinyin", schemas: ["pinyin.schema"],
+            dependencies: [], reverseDependencies: [], labels: ["latin"], license: "MIT"}
+    ]
+    local expected_paths := ["", "汉语", "汉语 / 普通话", "汉语 / 方言", "英语", "汉语拼音"]
+    local index, path, text, names
+    try {
+        gui.catalog_entries := entries
+        gui.UpdateCategoryFilter()
+        AssertEqual(expected_paths.Length, gui.category_paths.Length,
+            "The category filter did not include every canonical path.")
+        for index, path in expected_paths {
+            AssertEqual(path, gui.category_paths[index], "The category path order or canonical value is wrong.")
+        }
+
+        gui.category_filter.Choose(3)
+        text := gui.category_filter.Text
+        AssertTrue(InStr(text, "普通话") > 0 && SubStr(text, 1, 4) = "    ",
+            "Leaf category labels must show an indented node name.")
+
+        gui.category_filter.Choose(2)
+        gui.RefreshCatalogView()
+        AssertEqual(2, gui.catalog_list.GetCount(), "Selecting a parent category must include only its subtree.")
+        names := gui.catalog_list.GetText(1, 2) . "|" . gui.catalog_list.GetText(2, 2)
+        AssertTrue(InStr(names, "Mandarin") > 0 && InStr(names, "Dialect") > 0
+            && InStr(names, "English") = 0 && InStr(names, "Pinyin") = 0,
+            "A parent category matched a sibling or prefix-only category.")
+
+        gui.category_filter.Choose(3)
+        gui.RefreshCatalogView()
+        AssertEqual(1, gui.catalog_list.GetCount(), "Selecting a leaf category must include only that leaf.")
+        AssertEqual("Mandarin", gui.catalog_list.GetText(1, 2), "The wrong leaf category row was shown.")
+
+        gui.category_filter.Choose(1)
+        gui.search_edit.Value := "汉语 / 方言"
+        gui.RefreshCatalogView()
+        AssertEqual(1, gui.catalog_list.GetCount(), "Search must match a full category path.")
+        AssertEqual("Dialect", gui.catalog_list.GetText(1, 2), "Full-path search selected the wrong row.")
+
+        gui.search_edit.Value := "no such scheme"
+        gui.RefreshCatalogView()
+        AssertEqual(0, gui.catalog_list.GetCount(), "A search miss must not leave stale rows visible.")
+        AssertTrue(!gui.install_button.Enabled && InStr(gui.detail_title.Value, "Select a catalog entry") > 0,
+            "A search miss must clear details and disable Install.")
+
+        gui.search_edit.Value := ""
+        gui.RefreshCatalogView()
+        gui.catalog_list.Modify(2, "Select")
+        gui.OnCatalogSelection(gui.catalog_list, 2, true)
+        AssertTrue(InStr(gui.detail_title.Value, "Dialect") > 0
+            && InStr(gui.detail_dependencies.Value, "base") > 0
+            && InStr(gui.detail_labels.Value, "regional") > 0,
+            "Current selection details were not preserved after category filtering.")
+    } finally {
+        gui.Dispose()
+    }
+}
+
+RimeDepotGuiSmokeCategoryNames() {
+    local gui := RimeDepotGui(RimeDepotGuiFakeService(), RimeDepotGuiSettings(),
+        A_Temp . "\\RimeDepot-GuiSmoke-category-names.ini")
+    local entries := [
+        {category_path: "汉语 / 普通话", name: "Mandarin", repo: "owner/mandarin", schemas: ["mandarin.schema"]},
+        {category_path: "英语 / 普通话", name: "English pronunciation", repo: "owner/english-pronunciation",
+            schemas: ["english-pronunciation.schema"]},
+        {category_path: "All categories", name: "Literal category", repo: "owner/literal-category",
+            schemas: ["literal.schema"]}
+    ]
+    local han_index, english_index, literal_index, selected_index, text
+    try {
+        gui.catalog_entries := entries
+        gui.UpdateCategoryFilter()
+        han_index := RimeDepotGuiSmokeFindCategoryIndex(gui, "汉语 / 普通话")
+        english_index := RimeDepotGuiSmokeFindCategoryIndex(gui, "英语 / 普通话")
+        literal_index := RimeDepotGuiSmokeFindCategoryIndex(gui, "All categories")
+        AssertTrue(han_index > 0 && english_index > 0 && literal_index > 0
+            && han_index != english_index && english_index != literal_index,
+            "Distinct canonical category paths were not retained.")
+
+        gui.category_filter.Choose(han_index)
+        text := gui.category_filter.Text
+        AssertTrue(InStr(text, "普通话 (汉语)") > 0,
+            "The first duplicate leaf did not include its parent path.")
+        gui.RefreshCatalogView()
+        AssertEqual(1, gui.catalog_list.GetCount(), "The first duplicate leaf selected the wrong subtree.")
+        AssertEqual("Mandarin", gui.catalog_list.GetText(1, 2), "The first duplicate leaf selected the wrong entry.")
+
+        gui.category_filter.Choose(english_index)
+        text := gui.category_filter.Text
+        AssertTrue(InStr(text, "普通话 (英语)") > 0,
+            "The second duplicate leaf did not include its parent path.")
+        gui.RefreshCatalogView()
+        AssertEqual(1, gui.catalog_list.GetCount(), "The second duplicate leaf selected the wrong subtree.")
+        AssertEqual("English pronunciation", gui.catalog_list.GetText(1, 2),
+            "The second duplicate leaf selected the wrong entry.")
+
+        gui.category_filter.Choose(literal_index)
+        text := gui.category_filter.Text
+        AssertTrue(InStr(text, "All categories (category)") > 0,
+            "A literal All categories node was confused with the sentinel.")
+        gui.RefreshCatalogView()
+        AssertEqual(1, gui.catalog_list.GetCount(), "The literal All categories node selected the wrong entry.")
+        AssertEqual("Literal category", gui.catalog_list.GetText(1, 2),
+            "The literal All categories node selected the wrong entry.")
+
+        gui.category_filter.Choose(english_index)
+        selected_index := gui.category_filter.Value
+        gui.UpdateCategoryFilter()
+        AssertEqual(english_index, gui.category_filter.Value,
+            "Rebuilding categories changed the selected index unexpectedly.")
+        AssertEqual("英语 / 普通话", gui.SelectedCategoryPath(),
+            "Rebuilding categories did not preserve the selected canonical path.")
+        AssertEqual(selected_index, gui.category_filter.Value,
+            "Rebuilding categories did not preserve the selected value.")
+        gui.RefreshCatalogView()
+        gui.catalog_list.Modify(1, "Select")
+        gui.OnCatalogSelection(gui.catalog_list, 1, true)
+        AssertTrue(InStr(gui.detail_summary.Value, "Category: 英语 / 普通话") > 0,
+            "Details did not use the canonical category path.")
+    } finally {
+        gui.Dispose()
+    }
+}
+
+RimeDepotGuiSmokeFindCategoryIndex(gui, target) {
+    local index, path
+    for index, path in gui.category_paths {
+        if path = target {
+            return index
+        }
+    }
+    return 0
+}
+
+RimeDepotGuiSmokeGeometry() {
+    ; No service is needed for geometry.  This also prevents Show("Hide")'s
+    ; deferred initial catalog load from racing the mode-resize assertions.
+    local gui := RimeDepotGui(0, RimeDepotGuiSettings(),
+        A_Temp . "\\RimeDepot-GuiSmoke-geometry.ini")
+    local source, x, y, width, height, direct_height, rppi_height, width_before, width_after
+    local mode_popup_height, category_popup_height, ref_popup_height
+    local mode_closed_height, category_closed_height, ref_closed_height
+    try {
+        source := FileRead(A_ScriptDir . "\\..\\..\\RimeDepotGui.ahk", "UTF-8")
+        AssertTrue(InStr(source, 'AddDropDownList("x110 y146 w210 R2 Choose1"') > 0,
+            "Mode DropDownList must use R2 rows.")
+        AssertTrue(InStr(source, 'AddDropDownList("x448 y194 w210 R10 Choose1"') > 0,
+            "Category DropDownList must use R10 rows.")
+        AssertTrue(InStr(source, '"x78 y250 w180 R4 Choose1"') > 0,
+            "Direct ref-kind DropDownList must use R4 rows.")
+
+        AssertTrue(!gui._shown, "Constructing the GUI must not show a window.")
+        gui.direct_group.GetPos(&x, &y, &width, &height)
+        AssertEqual(184, y, "Direct group moved away from its reserved top position.")
+        AssertTrue(height >= 170, "Direct group is too short for its fields.")
+        gui.direct_source_edit.GetPos(&x, &y, &width, &height)
+        AssertEqual(210, y, "Direct source field overlaps the group title.")
+        gui.direct_ref_edit.GetPos(&x, &y, &width, &height)
+        AssertEqual(250, y, "Direct ref field is not below the group title.")
+        gui.direct_recipe_edit.GetPos(&x, &y, &width, &height)
+        AssertEqual(290, y, "Direct recipe field is not below the group title.")
+
+        gui.SetMode("direct")
+        AssertTrue(!gui._shown, "Changing mode before Show must not show the window.")
+        gui.SetMode("rppi")
+        gui.initial_load_started := true
+        gui.Show("Hide")
+        gui.Show("Hide w900")
+        gui.GetClientPos(&x, &y, &width_before, &height)
+        AssertEqual(900, width_before, "An explicit width option was not applied on the first/second Show.")
+
+        gui.mode_selector.GetPos(&x, &y, &width, &mode_closed_height)
+        gui.category_filter.GetPos(&x, &y, &width, &category_closed_height)
+        mode_popup_height := RimeDepotGuiSmokeDropdownHeight(gui.mode_selector)
+        category_popup_height := RimeDepotGuiSmokeDropdownHeight(gui.category_filter)
+        AssertTrue(mode_popup_height > mode_closed_height && category_popup_height > category_closed_height
+            && category_popup_height > mode_popup_height,
+            "Mode/category popup heights did not reflect their R2/R10 row options.")
+
+        gui.SetMode("direct")
+        gui.GetClientPos(&x, &y, &width, &direct_height)
+        AssertTrue(gui._hidden && direct_height <= 450,
+            "Direct mode did not use its compact hidden window height.")
+        gui.GetClientPos(&x, &y, &width_after, &height)
+        AssertEqual(width_before, width_after, "Mode switching reset the current window width.")
+        gui.direct_ref_kind.GetPos(&x, &y, &width, &ref_closed_height)
+        ref_popup_height := RimeDepotGuiSmokeDropdownHeight(gui.direct_ref_kind)
+        AssertTrue(ref_popup_height > ref_closed_height && category_popup_height > ref_popup_height
+            && ref_popup_height > mode_popup_height,
+            "Direct ref popup height did not reflect its R4 row option.")
+
+        gui.SetMode("rppi")
+        gui.GetClientPos(&x, &y, &width, &rppi_height)
+        AssertTrue(rppi_height > direct_height && rppi_height >= 700,
+            "RPPI mode did not restore the tall catalog window height.")
+        gui.install_button.GetPos(&x, &y, &width, &height)
+        AssertEqual(194, y, "RPPI Install button did not return to the catalog row.")
+        gui.SetMode("direct")
+        gui.install_button.GetPos(&x, &y, &width, &height)
+        AssertEqual(210, y, "Direct Install button did not move beside Source.")
+        gui.status_text.GetPos(&x, &y, &width, &height)
+        AssertEqual(374, y, "Direct status text is not directly below the source group.")
+    } finally {
+        gui.Dispose()
+    }
+}
+
+RimeDepotGuiSmokeDropdownHeight(control) {
+    local rect := Buffer(16, 0), result, top, bottom
+    result := DllCall("SendMessageW", "Ptr", control.Hwnd, "UInt", 0x0152,
+        "Ptr", 0, "Ptr", rect.Ptr, "Ptr")
+    AssertTrue(result != 0, "CB_GETDROPPEDCONTROLRECT failed for a hidden DropDownList.")
+    top := NumGet(rect, 4, "Int")
+    bottom := NumGet(rect, 12, "Int")
+    AssertTrue(bottom > top, "CB_GETDROPPEDCONTROLRECT returned an empty rectangle.")
+    return bottom - top
+}
+
+RimeDepotGuiSmokeBusy() {
+    local service := RimeDepotGuiFakeService()
+    local gui := RimeDepotGui(service, RimeDepotGuiSettings(), A_Temp . "\\RimeDepot-GuiSmoke-busy.ini")
+    local entry := {category_path: "demo", name: "Busy fixture", repo: "owner/busy", schemas: ["busy.schema"],
+        dependencies: ["base"], reverseDependencies: [], labels: ["busy"], license: "MIT"}
+    local old_title, old_count, token
+    try {
+        gui.catalog_entries := [entry]
+        gui.UpdateCategoryFilter()
+        gui.RefreshCatalogView()
+        gui.catalog_list.Modify(1, "Select")
+        gui.OnCatalogSelection(gui.catalog_list, 1, true)
+        old_title := gui.detail_title.Value
+        old_count := gui.catalog_list.GetCount()
+
+        AssertTrue(gui.StartCatalogLoad(false), "The busy fixture operation did not start.")
+        token := gui.operation_token
+        AssertTrue(gui.busy, "The GUI did not enter busy state.")
+        AssertTrue(!gui.mode_selector.Enabled && !gui.search_edit.Enabled && !gui.category_filter.Enabled
+            && !gui.catalog_list.Enabled && !gui.refresh_button.Enabled,
+            "RPPI controls were not disabled while the operation was busy.")
+        AssertTrue(!gui.direct_source_edit.Enabled && !gui.direct_ref_kind.Enabled
+            && !gui.direct_ref_edit.Enabled && !gui.direct_recipe_edit.Enabled,
+            "Direct controls were not disabled while the operation was busy.")
+        AssertTrue(gui.cancel_button.Enabled, "Cancel must remain enabled while busy.")
+        AssertTrue(gui.detail_title.Enabled, "Details text should remain readable while busy.")
+
+        gui.search_edit.Value := "must not refresh"
+        gui.OnFilterChanged()
+        AssertEqual(old_count, gui.catalog_list.GetCount(), "Busy filter input changed the visible rows.")
+        AssertEqual(old_title, gui.detail_title.Value, "Busy filter input cleared the current details.")
+        gui.SetMode("direct")
+        AssertEqual("rppi", gui.mode, "Busy mode switching must be ignored.")
+
+        gui.OnOperationError(token - 1, Error("stale operation"))
+        AssertTrue(gui.busy, "A stale callback changed the current busy operation.")
+        AssertTrue(gui.CancelActiveJob(), "Cancel did not delegate to the active fake job.")
+        AssertTrue(!gui.busy && !gui.cancel_button.Enabled && gui.mode_selector.Enabled
+            && gui.search_edit.Enabled && gui.category_filter.Enabled && gui.catalog_list.Enabled
+            && gui.refresh_button.Enabled && gui.direct_source_edit.Enabled
+            && InStr(gui.status_text.Value, "Operation failed") > 0
+            && InStr(gui.status_text.Value, "Cancellation requested") = 0,
+            "Controls were not restored after the busy operation finished.")
+    } finally {
+        gui.Dispose()
+    }
+}
+
 class RimeDepotGuiFakeService {
     __New(synchronous_catalog := false, catalog_error := false) {
         this.config := 0
@@ -324,7 +603,12 @@ class RimeDepotGuiFakeJob {
     }
 
     Cancel() {
+        if this.cancelled || this.delivered {
+            return
+        }
         this.cancelled := true
+        this.delivered := true
+        this.callbacks.ReportError(this, Error("fake cancellation"))
     }
 }
 
