@@ -534,7 +534,10 @@ class RimeDepotUtil {
 
     static SafeRelativePath(value) {
         value := StrReplace(String(value), "/", "\")
-        if value = "" || SubStr(value, 1, 1) = "\" || value ~= "i)^[a-z]:" || InStr(value, "`0") {
+        ; AHK's `0 spelling is the digit-zero character, while Chr(0) is
+        ; treated as an empty needle by InStr.  ZIP callers scan raw filename
+        ; bytes before decoding, so do not use a false NUL check here.
+        if value = "" || SubStr(value, 1, 1) = "\" || value ~= "i)^[a-z]:" {
             throw RimeDepotSecurityError("Unsafe relative path: " . value)
         }
         for _, piece in StrSplit(value, "\") {

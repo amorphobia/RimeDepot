@@ -619,9 +619,10 @@ class RimeDepotGui extends Gui {
     }
 
     OnCatalogSelection(ctrl, row, selected) {
-        if selected && row > 0 && this.visible_entries.Has(row) {
-            this.ShowDetails(this.visible_entries[row])
-        } else if !selected {
+        local current_row := ctrl.GetNext(0)
+        if current_row > 0 && this.visible_entries.Has(current_row) {
+            this.ShowDetails(this.visible_entries[current_row])
+        } else {
             this.ClearDetails()
         }
         this.install_button.Enabled := !this.busy && this.catalog_list.GetNext(0) > 0

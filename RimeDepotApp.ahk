@@ -38,7 +38,6 @@ RimeDepotAppMain() {
 
     RimeDepotAppGui := RimeDepotGui(service, settings, settings_path)
     OnExit(RimeDepotAppOnExit)
-    Persistent(true)
     RimeDepotAppGui.Show()
 }
 

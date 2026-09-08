@@ -23,6 +23,7 @@ try {
 RimeDepotGuiSmokeMain() {
     RunTest("RimeDepot GUI constructs with injected service", RimeDepotGuiSmokeConstruction.Bind())
     RunTest("RimeDepot GUI loads a fake catalog asynchronously", RimeDepotGuiSmokeCatalog.Bind())
+    RunTest("RimeDepot GUI keeps details for the current selection", RimeDepotGuiSmokeSelection.Bind())
     ExitApp(0)
 }
 
@@ -68,6 +69,61 @@ RimeDepotGuiSmokeCatalog() {
             InStr(gui.detail_dependencies.Value, "base") > 0,
             "The dependency detail was not populated."
         )
+    } finally {
+        gui.Dispose()
+    }
+}
+
+RimeDepotGuiSmokeSelection() {
+    local service := RimeDepotGuiFakeService()
+    local gui := RimeDepotGui(service, RimeDepotGuiSettings(), A_Temp . "\\RimeDepot-GuiSmoke.ini")
+    local first := {
+        category_path: "demo",
+        name: "First scheme",
+        repo: "owner/first",
+        schemas: ["first.schema"],
+        dependencies: ["first-base"],
+        reverseDependencies: ["first-child"],
+        labels: ["first-label"],
+        license: "MIT"
+    }
+    local second := {
+        category_path: "demo",
+        name: "Second scheme",
+        repo: "owner/second",
+        schemas: ["second.schema"],
+        dependencies: ["second-base"],
+        reverseDependencies: ["second-child"],
+        labels: ["second-label"],
+        license: "Apache-2.0"
+    }
+    try {
+        gui.catalog_entries := [first, second]
+        gui.UpdateCategoryFilter()
+        gui.RefreshCatalogView()
+        gui.catalog_list.Modify(1, "Select")
+        gui.OnCatalogSelection(gui.catalog_list, 1, true)
+        AssertTrue(InStr(gui.detail_title.Value, "First scheme") > 0,
+            "The first selected scheme was not shown in the details.")
+
+        gui.catalog_list.Modify(2, "Select")
+        gui.OnCatalogSelection(gui.catalog_list, 2, true)
+        ; A delayed deselect notification for row 1 must synchronize from the
+        ; ListView's current selection instead of clearing row 2's details.
+        gui.OnCatalogSelection(gui.catalog_list, 1, false)
+        AssertTrue(InStr(gui.detail_title.Value, "Second scheme") > 0
+            && InStr(gui.detail_schemas.Value, "second.schema") > 0
+            && InStr(gui.detail_dependencies.Value, "second-base") > 0
+            && InStr(gui.detail_reverse_dependencies.Value, "second-child") > 0
+            && InStr(gui.detail_labels.Value, "second-label") > 0,
+            "A stale deselect notification cleared the current scheme details.")
+
+        gui.catalog_list.Modify(2, "-Select")
+        gui.OnCatalogSelection(gui.catalog_list, 2, false)
+        AssertTrue(InStr(gui.detail_title.Value, "Select a catalog entry") > 0
+            && gui.detail_schemas.Value = "Schemas: "
+            && gui.detail_dependencies.Value = "Dependencies: ",
+            "Details were not cleared after the ListView lost its selection.")
     } finally {
         gui.Dispose()
     }

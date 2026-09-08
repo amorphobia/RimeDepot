@@ -38,6 +38,35 @@ class RimeDepotHttpResponse {
     }
 }
 
+/** Normalize WinHTTP's byte-array response into the Buffer expected by callers. */
+RimeDepotHttpNormalizeBinary(value) {
+    if value is Buffer {
+        return value
+    }
+    if !IsObject(value) {
+        return value
+    }
+    try {
+        if ComObjType(value) != 0x2011 {
+            return value
+        }
+    } catch {
+        return value
+    }
+
+    local lower_bound := value.MinIndex(), upper_bound := value.MaxIndex()
+    local count := upper_bound - lower_bound + 1, result, offset
+    if count <= 0 {
+        return Buffer(0)
+    }
+    result := Buffer(count)
+    Loop count {
+        offset := A_Index - 1
+        NumPut("UChar", value[lower_bound + offset], result, offset)
+    }
+    return result
+}
+
 /**
  * WinHTTP request wrapper.  WinHTTP is opened in asynchronous mode and a
  * short SetTimer polls WaitForResponse(0), so Start never blocks the GUI
@@ -199,7 +228,9 @@ class RimeDepotHttpRequest {
             ; properties after WinHTTP reports that the async request is done.
             status := this.Request.Status
             binary := RimeDepotUtil.GetValue(this.Options, ["Binary", "binary"], false)
-            body := binary ? this.Request.ResponseBody : this.Request.ResponseText
+            body := binary
+                ? RimeDepotHttpNormalizeBinary(this.Request.ResponseBody)
+                : this.Request.ResponseText
             headers := this._ParseHeaders(this.Request.GetAllResponseHeaders())
             this._Complete(RimeDepotHttpResponse(this.Url, status, body, headers))
         } catch as err {

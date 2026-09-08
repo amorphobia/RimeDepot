@@ -24,6 +24,7 @@ RimeDepotCoreProbeMain() {
     RimeDepotCoreProbeTest("JSON", RimeDepotCoreProbeJson.Bind())
     RimeDepotCoreProbeTest("YAML", RimeDepotCoreProbeYaml.Bind())
     RimeDepotCoreProbeTest("target and security", RimeDepotCoreProbeTarget.Bind())
+    RimeDepotCoreProbeTest("safe relative paths and ZIP names", RimeDepotCoreProbeSafeRelativePaths.Bind())
     RimeDepotCoreProbeTest("config precedence", RimeDepotCoreProbeConfig.Bind())
     RimeDepotCoreProbeTest("GUI settings INI round-trip", RimeDepotCoreProbeGuiSettings.Bind())
     RimeDepotCoreProbeTest("catalog async and cache fallback", RimeDepotCoreProbeCatalog.Bind())
@@ -36,8 +37,10 @@ RimeDepotCoreProbeMain() {
     RimeDepotCoreProbeTest("recipe apply", RimeDepotCoreProbeRecipeApply.Bind())
     RimeDepotCoreProbeTest("direct owner/repository InstallTarget", RimeDepotCoreProbeInstallTarget.Bind())
     RimeDepotCoreProbeTest("archive async and cancellation", RimeDepotCoreProbeArchive.Bind())
+    RimeDepotCoreProbeTest("archive binary type guard", RimeDepotCoreProbeArchiveBinaryGuard.Bind())
     RimeDepotCoreProbeTest("cache generation integrity", RimeDepotCoreProbeCacheIntegrity.Bind())
     RimeDepotCoreProbeTest("HTTP request lifecycle", RimeDepotCoreProbeHttpLifecycle.Bind())
+    RimeDepotCoreProbeTest("HTTP binary response normalization", RimeDepotCoreProbeHttpBinary.Bind())
     FileAppend("RimeDepot core probe passed`n", "*")
     ExitApp(0)
 }
@@ -78,6 +81,93 @@ RimeDepotCoreProbeTarget() {
         "Unsafe target parameter was accepted.")
     RimeDepotCoreProbeThrows(RimeDepotSecurityError, RimeDepotUtil.SafeRelativePath.Bind("..\\escape"),
         "Parent path was accepted.")
+}
+
+RimeDepotCoreProbeSafeRelativePaths() {
+    local valid := ["schema0.yaml", "openfly-f098123", "openfly-f098123/"]
+    local invalid := [
+        "",
+        "..",
+        ".",
+        "/abs",
+        Chr(92) . Chr(92) . "UNC" . Chr(92) . "share",
+        "C:" . Chr(92) . "drive",
+        "folder:name"
+    ]
+    local root := A_Temp . "\\RimeDepotCoreProbe-safe-paths-" . A_TickCount . "-"
+        . DllCall("GetCurrentProcessId", "UInt")
+    local directory_path := root . "\\openfly-directory.zip", nul_path := root . "\\nul-name.zip"
+    local directory_name := RimeDepotCoreProbeAsciiBytes("openfly-f098123/")
+    local nul_name := RimeDepotCoreProbeAsciiBytes("openfly-f098123")
+    local value, normalized, caught, err, byte
+    nul_name.Push(0)
+    for _, byte in RimeDepotCoreProbeAsciiBytes(".schema") {
+        nul_name.Push(byte)
+    }
+    for _, value in valid {
+        normalized := RimeDepotUtil.SafeRelativePath(value)
+        RimeDepotCoreProbeAssert(normalized = StrReplace(value, "/", "\"),
+            "A valid relative path was not normalized: " . value)
+    }
+    for _, value in invalid {
+        caught := false
+        try {
+            RimeDepotUtil.SafeRelativePath(value)
+        } catch as err {
+            caught := true
+            RimeDepotCoreProbeAssert(err is RimeDepotSecurityError,
+                "An unsafe relative path raised the wrong error type: " . value)
+        }
+        RimeDepotCoreProbeAssert(caught, "An unsafe relative path was accepted: " . value)
+    }
+    ; Chr(0) is constructible, but the v2 InStr implementation treats it as
+    ; an empty needle.  ZIP names therefore get a raw-byte NUL check before
+    ; StrGet decodes them.
+    try {
+        RimeDepotArchive.WriteBinary(directory_path,
+            RimeDepotCoreProbeZipCentralDirectory(directory_name))
+        RimeDepotCoreProbeAssert(RimeDepotArchive.ValidateZip(directory_path),
+            "A directory ZIP name containing digit zero and a trailing slash was rejected.")
+
+        RimeDepotArchive.WriteBinary(nul_path, RimeDepotCoreProbeZipCentralDirectory(nul_name))
+        caught := false
+        try {
+            RimeDepotArchive.ValidateZip(nul_path)
+        } catch as err {
+            caught := true
+            RimeDepotCoreProbeAssert(err is RimeDepotSecurityError
+                && InStr(err.Message, "NUL") > 0,
+                "A ZIP filename NUL raised the wrong error type or message.")
+        }
+        RimeDepotCoreProbeAssert(caught, "A ZIP filename containing a NUL byte was accepted.")
+    } finally {
+        if DirExist(root) {
+            try RimeDepotUtil.DeleteTree(root)
+        }
+    }
+}
+
+RimeDepotCoreProbeAsciiBytes(value) {
+    local bytes := [], index
+    Loop StrLen(value) {
+        index := A_Index
+        bytes.Push(Ord(SubStr(value, index, 1)))
+    }
+    return bytes
+}
+
+RimeDepotCoreProbeZipCentralDirectory(name_bytes) {
+    local directory_size := 46 + name_bytes.Length, eocd_offset := directory_size
+    local data := Buffer(directory_size + 22, 0), index, byte
+    NumPut("UInt", 0x02014B50, data, 0)
+    NumPut("UShort", name_bytes.Length, data, 28)
+    for index, byte in name_bytes {
+        NumPut("UChar", byte, data, 46 + index - 1)
+    }
+    NumPut("UInt", 0x06054B50, data, eocd_offset)
+    NumPut("UShort", 1, data, eocd_offset + 10)
+    NumPut("UInt", directory_size, data, eocd_offset + 12)
+    return data
 }
 
 RimeDepotCoreProbeConfig() {
@@ -482,6 +572,52 @@ RimeDepotCoreProbeArchive() {
     }
 }
 
+RimeDepotCoreProbeArchiveBinaryGuard() {
+    local root := A_Temp . "\\RimeDepotCoreProbe-archive-binary-" . A_TickCount . "-"
+        . DllCall("GetCurrentProcessId", "UInt")
+    local path := root . "\\archive.bin", invalid := {Size: 4}, caught := false
+    local body := Buffer(4, 0), file, readback
+    NumPut("UChar", 0x00, body, 0)
+    NumPut("UChar", 0x7F, body, 1)
+    NumPut("UChar", 0x80, body, 2)
+    NumPut("UChar", 0xFF, body, 3)
+    try {
+        try {
+            RimeDepotArchive.WriteBinary(path, invalid)
+        } catch as err {
+            caught := true
+            RimeDepotCoreProbeAssert(err is RimeDepotError
+                && InStr(err.Message, "did not contain binary data") > 0,
+                "An invalid archive response raised the wrong error type or message.")
+        }
+        RimeDepotCoreProbeAssert(caught, "A non-Buffer object with Size was accepted as archive data.")
+        RimeDepotCoreProbeAssert(!FileExist(path), "The rejected archive response created an output file.")
+
+        RimeDepotArchive.WriteBinary(path, body)
+        RimeDepotCoreProbeAssert(FileExist(path) && FileGetSize(path) = body.Size,
+            "A valid Buffer was not written to the archive staging path.")
+        file := FileOpen(path, "r")
+        if !file {
+            throw Error("The archive binary fixture could not be reopened.")
+        }
+        try {
+            readback := Buffer(body.Size, 0)
+            file.RawRead(readback)
+        } finally {
+            file.Close()
+        }
+        RimeDepotCoreProbeAssert(NumGet(readback, 0, "UChar") = 0x00
+            && NumGet(readback, 1, "UChar") = 0x7F
+            && NumGet(readback, 2, "UChar") = 0x80
+            && NumGet(readback, 3, "UChar") = 0xFF,
+            "Archive WriteBinary changed the Buffer bytes.")
+    } finally {
+        if DirExist(root) {
+            try RimeDepotUtil.DeleteTree(root)
+        }
+    }
+}
+
 RimeDepotCoreProbeCacheIntegrity() {
     local root, url, body_one, body_two, body_three, cache, response_one, response_two, response_three
     local cached, paths, metadata_one, metadata_two, failing_cache, writer, tampered_metadata, body_path
@@ -654,6 +790,76 @@ RimeDepotCoreProbeHttpLifecycle() {
         "HTTP polling cancellation did not abort and clean up its timer.")
     cancel_request._Poll()
     RimeDepotCoreProbeAssert(cancel_outcome.Calls = 0, "A late cancelled HTTP poll delivered a callback.")
+}
+
+RimeDepotCoreProbeHttpBinary() {
+    local client := RimeDepotHttpClient(), outcome := RimeDepotCoreProbeOutcome()
+    local request := RimeDepotHttpRequest(client, "https://example.invalid/binary",
+        ObjBindMethod(outcome, "Http"), Map("Binary", true))
+    local body := ComObjArray(0x11, 4), lower_bound := body.MinIndex(), normalized
+    local existing := Buffer(1), existing_normalized, wrong_type, wrong_normalized
+    local empty := 0, empty_normalized, reject_root := A_Temp . "\\RimeDepotCoreProbe-http-binary-"
+        . A_TickCount . "-" . DllCall("GetCurrentProcessId", "UInt")
+    local reject_path := reject_root . "\\wrong-type.bin", rejected := false
+    try {
+        existing_normalized := RimeDepotHttpNormalizeBinary(existing)
+        RimeDepotCoreProbeAssert(existing_normalized is Buffer
+            && ObjPtr(existing_normalized) = ObjPtr(existing),
+            "An existing Buffer was copied instead of returned unchanged.")
+
+        body[lower_bound] := 0x00
+        body[lower_bound + 1] := 0x7F
+        body[lower_bound + 2] := 0x80
+        body[lower_bound + 3] := 0xFF
+        request.Request := RimeDepotCoreProbeHttpPollRequest([true], 200, "unused", "X-Binary: yes`r`n")
+        request.Request.ResponseBody := body
+        request.Status := "running"
+        request._start_tick := A_TickCount
+        request._timeout := 5000
+        request._timer_active := true
+        client._requests[request.Id] := request
+
+        request._Poll()
+        normalized := outcome.Value.Body
+        RimeDepotCoreProbeAssert(outcome.Calls = 1 && outcome.Success,
+            "Binary HTTP fixture did not complete successfully.")
+        RimeDepotCoreProbeAssert(normalized is Buffer && normalized.Size = 4,
+            "A COM byte array was not normalized to a four-byte Buffer.")
+        RimeDepotCoreProbeAssert(NumGet(normalized, 0, "UChar") = 0x00
+            && NumGet(normalized, 1, "UChar") = 0x7F
+            && NumGet(normalized, 2, "UChar") = 0x80
+            && NumGet(normalized, 3, "UChar") = 0xFF,
+            "Binary HTTP normalization changed the first or last byte.")
+
+        wrong_type := ComObjArray(0x12, 2)
+        wrong_normalized := RimeDepotHttpNormalizeBinary(wrong_type)
+        RimeDepotCoreProbeAssert(ObjPtr(wrong_normalized) = ObjPtr(wrong_type),
+            "An unsupported COM array type was unexpectedly converted.")
+        try {
+            RimeDepotArchive.WriteBinary(reject_path, wrong_normalized)
+        } catch as err {
+            rejected := true
+            RimeDepotCoreProbeAssert(err is RimeDepotError,
+                "An unsupported COM array type raised the wrong archive error type.")
+        }
+        RimeDepotCoreProbeAssert(rejected,
+            "An unsupported COM array type was accepted by the archive boundary.")
+
+        try {
+            empty := ComObjArray(0x11, 0)
+        } catch as err {
+            FileAppend("INFO: zero-length ComObjArray is unsupported: " . err.Message . "`n", "*")
+        }
+        if IsObject(empty) {
+            empty_normalized := RimeDepotHttpNormalizeBinary(empty)
+            RimeDepotCoreProbeAssert(empty_normalized is Buffer && empty_normalized.Size = 0,
+                "A zero-length COM byte array was not normalized to Buffer(0).")
+        }
+    } finally {
+        if DirExist(reject_root) {
+            try RimeDepotUtil.DeleteTree(reject_root)
+        }
+    }
 }
 
 RimeDepotCoreProbeWait(job) {

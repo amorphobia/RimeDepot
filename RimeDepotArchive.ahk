@@ -52,7 +52,7 @@ class RimeDepotArchive {
     }
 
     static WriteBinary(path, value) {
-        if !IsObject(value) || !HasProp(value, "Size") {
+        if !(value is Buffer) {
             throw RimeDepotError("The archive response did not contain binary data.", "RimeDepotArchive")
         }
         directory := RegExReplace(path, "[\\/][^\\/]*$")
@@ -124,6 +124,11 @@ class RimeDepotArchive {
             }
             if offset + 46 + name_length + extra_length + comment_length > size {
                 throw RimeDepotSecurityError("ZIP entry exceeds the central directory.")
+            }
+            Loop name_length {
+                if NumGet(data, offset + 46 + A_Index - 1, "UChar") = 0 {
+                    throw RimeDepotSecurityError("ZIP filename contains a NUL byte.")
+                }
             }
             name := StrGet(data.Ptr + offset + 46, name_length, "UTF-8")
             if SubStr(name, -1) != "/" {
