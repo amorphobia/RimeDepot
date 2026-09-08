@@ -1,0 +1,10 @@
+; Copy this file to RimeDepot.ini beside RimeDepotApp.ahk and edit the values.
+; Paths are ordinary Windows paths.  Leave GitPath empty to use git from PATH.
+
+[RimeDepot]
+CachePath=
+RimeDirectory=%APPDATA%\Rime
+RppiIndexUrl=https://raw.githubusercontent.com/rime/rppi/HEAD/index.json
+Proxy=
+UseGit=0
+GitPath=

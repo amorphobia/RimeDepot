@@ -1,0 +1,8 @@
+# Local configuration and generated runtime data.
+/RimeDepot.ini
+/cache/
+/staging/
+/archive/
+/temp/
+/tmp/
+/*.tmp-*
