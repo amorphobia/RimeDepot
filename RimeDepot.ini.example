@@ -1,5 +1,7 @@
 ; Copy this file to RimeDepot.ini beside RimeDepotApp.ahk and edit the values.
-; Paths are ordinary Windows paths.  Leave GitPath empty to use git from PATH.
+; Paths are ordinary Windows paths. UseGit/GitPath apply to Direct installs;
+; RPPI catalog selections always use HTTP(S) archives. Leave GitPath empty to
+; use git from PATH.
 
 [RimeDepot]
 CachePath=

@@ -24,6 +24,7 @@ RimeDepotCoreProbeMain() {
     RimeDepotCoreProbeTest("JSON", RimeDepotCoreProbeJson.Bind())
     RimeDepotCoreProbeTest("YAML", RimeDepotCoreProbeYaml.Bind())
     RimeDepotCoreProbeTest("target and security", RimeDepotCoreProbeTarget.Bind())
+    RimeDepotCoreProbeTest("structured targets and archive URLs", RimeDepotCoreProbeTargetMatrix.Bind())
     RimeDepotCoreProbeTest("safe relative paths and ZIP names", RimeDepotCoreProbeSafeRelativePaths.Bind())
     RimeDepotCoreProbeTest("config precedence", RimeDepotCoreProbeConfig.Bind())
     RimeDepotCoreProbeTest("GUI settings INI round-trip", RimeDepotCoreProbeGuiSettings.Bind())
@@ -36,6 +37,10 @@ RimeDepotCoreProbeMain() {
     RimeDepotCoreProbeTest("recipe safety", RimeDepotCoreProbeRecipe.Bind())
     RimeDepotCoreProbeTest("recipe apply", RimeDepotCoreProbeRecipeApply.Bind())
     RimeDepotCoreProbeTest("direct owner/repository InstallTarget", RimeDepotCoreProbeInstallTarget.Bind())
+    RimeDepotCoreProbeTest("direct target URL/ref contract", RimeDepotCoreProbeDirectTargetContract.Bind())
+    RimeDepotCoreProbeTest("catalog installs remain archive-only", RimeDepotCoreProbeCatalogArchiveOnly.Bind())
+    RimeDepotCoreProbeTest("catalog target ref overrides preserve source", RimeDepotCoreProbeCatalogTargetOverrides.Bind())
+    RimeDepotCoreProbeTest("archive ref URL matrix", RimeDepotCoreProbeArchiveUrls.Bind())
     RimeDepotCoreProbeTest("archive async and cancellation", RimeDepotCoreProbeArchive.Bind())
     RimeDepotCoreProbeTest("archive binary type guard", RimeDepotCoreProbeArchiveBinaryGuard.Bind())
     RimeDepotCoreProbeTest("cache generation integrity", RimeDepotCoreProbeCacheIntegrity.Bind())
@@ -83,6 +88,74 @@ RimeDepotCoreProbeTarget() {
         "Parent path was accepted.")
 }
 
+RimeDepotCoreProbeTargetMatrix() {
+    local parameters := Map("mode", "fast"), target, zip_target, ssh_target, git_target, entry, values
+    local sha_entry, branch_entry, archive_variant, archive_target, invalid_ref_target
+    target := RimeDepotTarget(Map(
+        "repo", "https://github.com/owner/repository",
+        "ref_kind", "tag",
+        "ref", "v1.2",
+        "recipe", "custom",
+        "parameters", parameters
+    ))
+    RimeDepotCoreProbeAssert(target.Repo = "https://github.com/owner/repository"
+        && target.Ref = "v1.2" && target.RefKind = "tag" && target.Tag = "v1.2"
+        && target.Recipe = "custom" && target.Parameters["mode"] = "fast",
+        "Structured target fields were not retained.")
+
+    zip_target := RimeDepotTarget("https://downloads.example.invalid/package.zip?token=one")
+    RimeDepotCoreProbeAssert(zip_target.Repo = zip_target.ArchiveUrl
+        && InStr(zip_target.ArchiveUrl, "package.zip?token=one") > 0,
+        "An explicit archive URL was not retained as both source and archive.")
+    ssh_target := RimeDepotTarget("ssh://git@example.invalid/owner/repository.git")
+    RimeDepotCoreProbeAssert(ssh_target.Repo = "ssh://git@example.invalid/owner/repository.git"
+        && ssh_target.RawBase = ssh_target.Repo,
+        "An SSH repository URL was split by the compact target parser.")
+    git_target := RimeDepotTarget("git@github.com:owner/repository.git")
+    RimeDepotCoreProbeAssert(git_target.Repo = "git@github.com:owner/repository.git"
+        && git_target.RawBase = git_target.Repo
+        && RimeDepotGitClient.RepoUrl(git_target.Repo) = git_target.Repo,
+        "A git@host:repo target was split or rejected by Git URL normalization.")
+
+    sha_entry := RimeDepotCatalogEntry(Map("id", "hex-ref", "repo", "owner/hex-ref", "ref", "deadbee"))
+    branch_entry := RimeDepotCatalogEntry(Map(
+        "id", "named-ref", "repo", "owner/named-ref", "ref", "release-candidate"
+    ))
+    RimeDepotCoreProbeAssert(sha_entry.Sha = "deadbee" && sha_entry.RefKind = "sha"
+        && branch_entry.Branch = "release-candidate" && branch_entry.RefKind = "branch",
+        "A catalog ref without ref_kind did not infer SHA versus branch correctly.")
+    for _, archive_variant in [
+        "https://downloads.example.invalid/package.zip#part",
+        "https://downloads.example.invalid/package.zip?token=one#part",
+        "https://downloads.example.invalid/package.zip?token=one"
+    ] {
+        archive_target := RimeDepotTarget(archive_variant)
+        RimeDepotCoreProbeAssert(archive_target.ArchiveUrl = archive_variant
+            && RimeDepotArchive.GitHubArchiveUrl(archive_variant) = archive_variant,
+            "An explicit archive URL with query/fragment suffix was rewritten: " . archive_variant)
+        RimeDepotCoreProbeThrows(RimeDepotUnsupportedError,
+            RimeDepotGitClient.RepoUrl.Bind(archive_variant),
+            "Git mode accepted an explicit archive URL with query/fragment suffix: " . archive_variant)
+    }
+    for _, invalid_ref_target in [
+        Map("repo", "owner/repository", "ref_kind", "branch"),
+        Map("repo", "owner/repository", "ref_kind", "tag"),
+        Map("repo", "owner/repository", "ref_kind", "sha")
+    ] {
+        RimeDepotCoreProbeThrows(RimeDepotTargetError,
+            RimeDepotTarget.Parse.Bind(invalid_ref_target),
+            "A structured target accepted ref_kind without a ref value.")
+    }
+
+    entry := RimeDepotCatalogEntry(Map(
+        "id", "demo", "repo", "owner/demo", "url", "https://github.com/owner/demo",
+        "archiveUrl", "https://downloads.example.invalid/demo.zip"
+    ))
+    values := entry.ToMap()
+    RimeDepotCoreProbeAssert(values["url"] = entry.Url && values["archiveUrl"] = entry.ArchiveUrl,
+        "CatalogEntry.ToMap did not expose URL and archive metadata.")
+}
+
 RimeDepotCoreProbeSafeRelativePaths() {
     local valid := ["schema0.yaml", "openfly-f098123", "openfly-f098123/"]
     local invalid := [
@@ -97,6 +170,7 @@ RimeDepotCoreProbeSafeRelativePaths() {
     local root := A_Temp . "\\RimeDepotCoreProbe-safe-paths-" . A_TickCount . "-"
         . DllCall("GetCurrentProcessId", "UInt")
     local directory_path := root . "\\openfly-directory.zip", nul_path := root . "\\nul-name.zip"
+    local malformed_path := root . "\\malformed-central-directory.zip"
     local directory_name := RimeDepotCoreProbeAsciiBytes("openfly-f098123/")
     local nul_name := RimeDepotCoreProbeAsciiBytes("openfly-f098123")
     local value, normalized, caught, err, byte
@@ -140,6 +214,22 @@ RimeDepotCoreProbeSafeRelativePaths() {
                 "A ZIP filename NUL raised the wrong error type or message.")
         }
         RimeDepotCoreProbeAssert(caught, "A ZIP filename containing a NUL byte was accepted.")
+
+        ; Keep the central-directory boundary smaller than the entry's
+        ; declared name.  The bytes after directory_end are the EOCD record;
+        ; they must never be interpreted as part of the entry header/name.
+        RimeDepotArchive.WriteBinary(malformed_path, RimeDepotCoreProbeMalformedZip())
+        caught := false
+        try {
+            RimeDepotArchive.ValidateZip(malformed_path)
+        } catch as err {
+            caught := true
+            RimeDepotCoreProbeAssert(err is RimeDepotSecurityError
+                && InStr(err.Message, "central directory") > 0,
+                "A ZIP central-directory overrun raised the wrong error type or message.")
+        }
+        RimeDepotCoreProbeAssert(caught,
+            "A ZIP entry was allowed to read its name beyond the central-directory boundary.")
     } finally {
         if DirExist(root) {
             try RimeDepotUtil.DeleteTree(root)
@@ -164,6 +254,18 @@ RimeDepotCoreProbeZipCentralDirectory(name_bytes) {
     for index, byte in name_bytes {
         NumPut("UChar", byte, data, 46 + index - 1)
     }
+    NumPut("UInt", 0x06054B50, data, eocd_offset)
+    NumPut("UShort", 1, data, eocd_offset + 10)
+    NumPut("UInt", directory_size, data, eocd_offset + 12)
+    return data
+}
+
+RimeDepotCoreProbeMalformedZip() {
+    local directory_size := 46, eocd_offset := directory_size, data := Buffer(directory_size + 22, 0)
+    NumPut("UInt", 0x02014B50, data, 0)
+    ; The single name byte would be the first EOCD byte, outside the declared
+    ; central directory.  A file-size-only check incorrectly accepts this.
+    NumPut("UShort", 1, data, 28)
     NumPut("UInt", 0x06054B50, data, eocd_offset)
     NumPut("UShort", 1, data, eocd_offset + 10)
     NumPut("UInt", directory_size, data, eocd_offset + 12)
@@ -515,6 +617,189 @@ RimeDepotCoreProbeInstallTarget() {
             RimeDepotUtil.DeleteTree(root)
         }
     }
+}
+
+RimeDepotCoreProbeDirectTargetContract() {
+    local root, cache_path, rime_path, service, target, job, entry, launcher, git_runner, git_service, git_job
+    local git_root, git_cache, git_rime, command
+    root := RimeDepotUtil.NormalizePath(A_Temp . "\\RimeDepotCoreProbe-direct-contract-" . A_TickCount
+        . "-" . DllCall("GetCurrentProcessId", "UInt"))
+    cache_path := RimeDepotUtil.JoinPath(root, "cache")
+    rime_path := RimeDepotUtil.JoinPath(root, "rime")
+    git_root := root . "-git"
+    git_cache := RimeDepotUtil.JoinPath(git_root, "cache")
+    git_rime := RimeDepotUtil.JoinPath(git_root, "rime")
+    try {
+        service := RimeDepotService(Map(
+            "CachePath", cache_path,
+            "RimeDirectory", rime_path,
+            "RppiIndexUrl", "https://example.invalid/index.json"
+        ), "", Map("Http", RimeDepotCoreProbeTransport(Map())))
+        target := Map(
+            "repo", "https://downloads.example.invalid/openfly.zip",
+            "ref_kind", "tag",
+            "ref", "v1",
+            "recipe", "custom",
+            "parameters", Map("mode", "fast")
+        )
+        job := service.InstallTarget(target, Map("UseGit", false))
+        entry := service.Catalog.Resolve("https://downloads.example.invalid/openfly.zip")
+        RimeDepotCoreProbeAssert(entry.Repo = target["repo"] && entry.ArchiveUrl = target["repo"]
+            && entry.Tag = "v1" && entry.RefKind = "tag" && entry.Recipe = "custom",
+            "Direct target metadata was not copied to the temporary catalog entry.")
+        RimeDepotCoreProbeAssert(job is RimeDepotJob && job.Cancel(),
+            "Direct archive target could not be cancelled.")
+
+        launcher := RimeDepotCoreProbeGitLauncher()
+        git_runner := RimeDepotGitRunner("git.exe", launcher)
+        git_service := RimeDepotService(Map(
+            "CachePath", git_cache,
+            "RimeDirectory", git_rime,
+            "RppiIndexUrl", "https://example.invalid/index.json"
+        ), "", Map("Http", RimeDepotCoreProbeTransport(Map()), "GitRunner", git_runner))
+        git_job := git_service.InstallTarget(Map(
+            "repo", "owner/direct",
+            "ref_kind", "branch",
+            "ref", "feature/direct",
+            "recipe", "custom",
+            "parameters", Map("mode", "fast")
+        ), Map("UseGit", true))
+        Sleep(100)
+        RimeDepotCoreProbeAssert(launcher.Commands.Length >= 1,
+            "Direct UseGit=true did not create a Git operation.")
+        command := launcher.Commands[1].Arguments
+        RimeDepotCoreProbeAssert(command.Length >= 6 && command[1] = "clone"
+            && command[4] = "--branch" && command[5] = "feature/direct"
+            && command[6] = "https://github.com/owner/direct.git",
+            "Direct Git target did not preserve the structured repository/ref fields.")
+        if !git_job.IsDone() {
+            git_job.Cancel()
+        }
+    } finally {
+        if DirExist(root) {
+            try RimeDepotUtil.DeleteTree(root)
+        }
+        if DirExist(git_root) {
+            try RimeDepotUtil.DeleteTree(git_root)
+        }
+    }
+}
+
+RimeDepotCoreProbeCatalogArchiveOnly() {
+    local root, cache_path, rime_path, transport, launcher, service, catalog, entry, dependency, job, calls
+    root := RimeDepotUtil.NormalizePath(A_Temp . "\\RimeDepotCoreProbe-catalog-archive-only-" . A_TickCount
+        . "-" . DllCall("GetCurrentProcessId", "UInt"))
+    cache_path := RimeDepotUtil.JoinPath(root, "cache")
+    rime_path := RimeDepotUtil.JoinPath(root, "rime")
+    try {
+        transport := RimeDepotCoreProbeTransport(Map())
+        launcher := RimeDepotCoreProbeGitLauncher()
+        service := RimeDepotService(Map(
+            "CachePath", cache_path,
+            "RimeDirectory", rime_path,
+            "UseGit", true,
+            "RppiIndexUrl", "https://example.invalid/index.json"
+        ), "", Map("Http", transport, "GitRunner", launcher))
+        catalog := RimeDepotCatalog()
+        dependency := catalog.Add(Map("id", "base", "name", "Base", "repo", "owner/base"), "base")
+        entry := catalog.Add(Map("id", "demo", "name", "Demo", "repo", "owner/demo"), "demo")
+        entry.Dependencies := [dependency.Id]
+        service.Catalog := catalog
+        job := service.InstallTarget(entry, Map("UseGit", true))
+        Sleep(100)
+        RimeDepotCoreProbeAssert(job is RimeDepotJob,
+            "CatalogEntry InstallTarget did not return a RimeDepotJob.")
+        calls := transport.Calls
+        RimeDepotCoreProbeAssert(calls.Length >= 1
+            && calls[1] = "https://github.com/owner/base/archive/HEAD.zip",
+            "The archive-only catalog fixture did not build its dependency plan.")
+        RimeDepotCoreProbeAssert(launcher.Commands.Length = 0,
+            "CatalogEntry dependency plan created a Git operation despite archive-only routing.")
+        RimeDepotCoreProbeAssert(job.Status = "failed" || job.Status = "cancelled",
+            "Archive-only catalog fixture did not reach the HTTP failure path.")
+    } finally {
+        if DirExist(root) {
+            try RimeDepotUtil.DeleteTree(root)
+        }
+    }
+}
+
+RimeDepotCoreProbeCatalogTargetOverrides() {
+    local root, cache_path, rime_path, transport, service, catalog, entry, job, calls
+    root := RimeDepotUtil.NormalizePath(A_Temp . "\\RimeDepotCoreProbe-catalog-target-" . A_TickCount
+        . "-" . DllCall("GetCurrentProcessId", "UInt"))
+    cache_path := RimeDepotUtil.JoinPath(root, "cache")
+    rime_path := RimeDepotUtil.JoinPath(root, "rime")
+    try {
+        transport := RimeDepotCoreProbeTransport(Map())
+        service := RimeDepotService(Map(
+            "CachePath", cache_path,
+            "RimeDirectory", rime_path,
+            "RppiIndexUrl", "https://example.invalid/index.json"
+        ), "", Map("Http", transport))
+        catalog := RimeDepotCatalog()
+        entry := catalog.Add(Map(
+            "id", "Openfly",
+            "name", "Openfly",
+            "repo", "owner/openfly",
+            "branch", "catalog-main",
+            "ref_kind", "branch"
+        ), "Openfly")
+        service.Catalog := catalog
+
+        ; A bare catalog id must retain the catalog's branch/ref when no
+        ; explicit target ref was supplied.
+        job := service.InstallTarget("Openfly", Map("UseGit", false))
+        Sleep(100)
+        calls := transport.Calls
+        RimeDepotCoreProbeAssert(calls.Length >= 1
+            && calls[1] = "https://github.com/owner/openfly/archive/refs/heads/catalog-main.zip",
+            "A bare catalog target cleared the catalog branch/ref.")
+
+        ; The package id resolves to the catalog entry, while the compact ref
+        ; remains a direct target override.  Its parsed Repo is not an
+        ; explicitly supplied source and must not replace owner/openfly.
+        job := service.InstallTarget("Openfly@feature/direct", Map("UseGit", false))
+        Sleep(100)
+        calls := transport.Calls
+        RimeDepotCoreProbeAssert(calls.Length >= 2,
+            "A catalog target override did not reach the archive transport.")
+        RimeDepotCoreProbeAssert(calls[2] = "https://github.com/owner/openfly/archive/refs/heads/feature%2Fdirect.zip",
+            "A catalog target override replaced the catalog repository with its package id.")
+        RimeDepotCoreProbeAssert(job.Status = "failed" || job.Status = "cancelled",
+            "The catalog target archive fixture did not reach its expected HTTP failure path.")
+    } finally {
+        if DirExist(root) {
+            try RimeDepotUtil.DeleteTree(root)
+        }
+    }
+}
+
+RimeDepotCoreProbeArchiveUrls() {
+    local branch_url, tag_url, sha_url, encoded_url
+    branch_url := RimeDepotArchive.GitHubArchiveUrl("owner/repository", "feature/space-name", "branch")
+    tag_url := RimeDepotArchive.GitHubArchiveUrl("https://github.com/owner/repository", "v1.2", "tag")
+    sha_url := RimeDepotArchive.GitHubArchiveUrl("owner/repository", "0123456789abcdef0123456789abcdef01234567", "sha")
+    encoded_url := "https://github.com/owner/repository/archive/refs/heads/feature%2Fspace-name.zip"
+    RimeDepotCoreProbeAssert(branch_url = encoded_url,
+        "Branch archive URL did not encode a slash as a single path byte.")
+    RimeDepotCoreProbeAssert(RimeDepotArchive.UrlEncodePath("feature/space name") = "feature%2Fspace%20name",
+        "Archive path encoding did not encode slash and space as UTF-8 path bytes.")
+    RimeDepotCoreProbeAssert(RimeDepotArchive.UrlEncodePath("feature/中文") = "feature%2F%E4%B8%AD%E6%96%87",
+        "Archive path encoding did not preserve UTF-8 bytes for a non-ASCII ref.")
+    RimeDepotCoreProbeAssert(tag_url = "https://github.com/owner/repository/archive/refs/tags/v1.2.zip",
+        "Tag archive URL used the wrong GitHub endpoint.")
+    RimeDepotCoreProbeAssert(sha_url = "https://github.com/owner/repository/archive/0123456789abcdef0123456789abcdef01234567.zip",
+        "SHA archive URL used the wrong GitHub endpoint.")
+    RimeDepotCoreProbeAssert(RimeDepotArchive.GitHubArchiveUrl("owner/repository")
+        = "https://github.com/owner/repository/archive/HEAD.zip",
+        "Default archive URL did not use GitHub's HEAD endpoint.")
+    RimeDepotCoreProbeAssert(RimeDepotArchive.GitHubArchiveUrl("https://downloads.example.invalid/package.zip")
+        = "https://downloads.example.invalid/package.zip",
+        "An explicit archive URL was rewritten.")
+    RimeDepotCoreProbeThrows(RimeDepotUnsupportedError,
+        RimeDepotArchive.GitHubArchiveUrl.Bind("https://gitlab.example.invalid/owner/repository"),
+        "A non-GitHub repository URL was accepted by archive mode.")
 }
 
 RimeDepotCoreProbeArchive() {
@@ -918,9 +1203,11 @@ class RimeDepotCoreProbeCallbacks extends RimeDepotCallbacks {
 class RimeDepotCoreProbeTransport {
     __New(responses) {
         this.Responses := responses
+        this.Calls := []
     }
 
     Get(url, options := 0, job := 0) {
+        this.Calls.Push(url)
         if this.Responses.Has(url) {
             response := this.Responses[url]
             return RimeDepotHttpResponse(response.Url, response.Status, response.Body, response.Headers, response.Error)

@@ -39,24 +39,41 @@ class RimeDepotService {
     }
 
     InstallEntry(entry, options := 0, callbacks := 0) {
+        if options is RimeDepotCallbacks || IsObject(options) && HasMethod(options, "Call") {
+            if !callbacks {
+                callbacks := options
+            }
+            options := Map()
+        } else if !IsObject(options) {
+            options := Map()
+        }
+        if !callbacks {
+            callbacks := RimeDepotUtil.GetValue(options, ["Callbacks", "callbacks"], 0)
+        }
+        options := this._CopyOptions(options)
+        ; RPPI entries are always archive installs.  This explicit override is
+        ; passed to the installer for every dependency in the plan, even when
+        ; the persisted direct-install preference enables Git.
+        options["UseGit"] := false
         if !this.Catalog {
             throw RimeDepotCatalogError("LoadCatalog must complete before InstallEntry.")
         }
         if !(entry is RimeDepotCatalogEntry) {
             entry := this.Catalog.Resolve(entry)
         }
-        return this._Install(entry, options, callbacks)
+        return this._Install(entry, options, callbacks, true)
     }
 
     InstallTarget(target, options := 0, callbacks := 0) {
+        if target is RimeDepotCatalogEntry {
+            return this.InstallEntry(target, options, callbacks)
+        }
         if target is RimeDepotTarget {
             parsed := target
-        } else if target is RimeDepotCatalogEntry {
-            parsed := RimeDepotTarget(target.Id)
         } else {
             parsed := RimeDepotTarget.Parse(target)
         }
-        return this._Install(parsed, options, callbacks)
+        return this._Install(parsed, options, callbacks, false)
     }
 
     Cancel() {
@@ -117,7 +134,7 @@ class RimeDepotService {
         return job
     }
 
-    _Install(target, options, callbacks) {
+    _Install(target, options, callbacks, archive_only := false) {
         if options is RimeDepotCallbacks || IsObject(options) && HasMethod(options, "Call") {
             if !callbacks {
                 callbacks := options
@@ -125,6 +142,10 @@ class RimeDepotService {
             options := Map()
         } else if !IsObject(options) {
             options := Map()
+        }
+        options := this._CopyOptions(options)
+        if archive_only {
+            options["UseGit"] := false
         }
         if !callbacks {
             callbacks := RimeDepotUtil.GetValue(options, ["Callbacks", "callbacks"], 0)
@@ -136,7 +157,11 @@ class RimeDepotService {
             ; still passed through the normal installer validation path.
             this.Catalog := RimeDepotCatalog()
         }
-        target := this._ResolveTarget(target)
+        if target is RimeDepotCatalogEntry {
+            target_entry := target
+        } else {
+            target_entry := this._ResolveTarget(target)
+        }
         job := this._Begin("install", callbacks)
         try {
             config := this.Config.With(options)
@@ -147,7 +172,8 @@ class RimeDepotService {
                 git_client := RimeDepotGitClient(config, this.GitRunner)
             }
             installer := RimeDepotInstaller(config, this.Http, git_client)
-            operation := installer.InstallAsync(target, this.Catalog, options, job,
+            operation := installer.InstallAsync(target is RimeDepotCatalogEntry ? target_entry : target,
+                this.Catalog, options, job,
                 ObjBindMethod(this, "_InstallDone", job))
             job.SetCancelHandler(ObjBindMethod(operation, "Cancel"))
         } catch as err {
@@ -171,18 +197,51 @@ class RimeDepotService {
             ; Direct owner/repository targets are useful when an application
             ; has no RPPI record for a private package.  They remain subject
             ; to the same archive/Git and path safety checks.
-            if InStr(parsed.RawBase, "/") {
+            if parsed.SourceExplicit || parsed.ArchiveUrl != "" {
+                id := parsed.RawBase
+                repo := parsed.Repo != "" ? parsed.Repo : parsed.RawBase
+                data := Map(
+                    "id", id,
+                    "name", parsed.Name != "" ? parsed.Name : id,
+                    "repo", repo,
+                    "url", repo,
+                    "archiveUrl", parsed.ArchiveUrl,
+                    "recipe", parsed.Recipe
+                )
+                if parsed.RefKind = "sha" {
+                    data["sha"] := parsed.Ref
+                } else if parsed.RefKind = "tag" {
+                    data["tag"] := parsed.Ref
+                } else if parsed.RefKind = "branch" {
+                    data["branch"] := parsed.Ref
+                }
                 entry := RimeDepotCatalogEntry(Map(
-                    "id", parsed.RawBase,
-                    "name", parsed.RawBase,
-                    "repo", parsed.RawBase,
-                    "branch", parsed.Ref
+                    "id", data["id"],
+                    "name", data["name"],
+                    "repo", data["repo"],
+                    "url", data["url"],
+                    "archiveUrl", data["archiveUrl"],
+                    "ref_kind", parsed.RefKind,
+                    "branch", RimeDepotUtil.GetString(data, ["branch"], ""),
+                    "tag", RimeDepotUtil.GetString(data, ["tag"], ""),
+                    "sha", RimeDepotUtil.GetString(data, ["sha"], ""),
+                    "recipe", data["recipe"]
                 ), parsed.RawBase)
                 this.Catalog.Add(entry, entry.Id)
                 return entry
             }
             throw err
         }
+    }
+
+    _CopyOptions(options) {
+        result := Map()
+        if IsObject(options) {
+            for key, value in options {
+                result[key] := value
+            }
+        }
+        return result
     }
 
     _CatalogDone(job, refresh, catalog, error, warnings) {

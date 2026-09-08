@@ -14,19 +14,31 @@
 class RimeDepotArchive {
     static GitHubArchiveUrl(repo, ref := "", ref_kind := "") {
         repo := String(repo)
+        if this.IsExplicitZipUrl(repo) {
+            ; An explicit archive is already a complete source URL.  Do not
+            ; append a ref or rewrite its path.
+            return repo
+        }
         if RimeDepotUtil.IsUrl(repo) {
-            ; A caller may provide an explicit archive URL.  Do not rewrite
-            ; it: this also supports GitHub Enterprise-compatible mirrors.
-            if RegExMatch(repo, "i)\.zip(?:\?|$)") {
-                return repo
+            if !RegExMatch(repo, "i)^https?://github\.com/", &match) {
+                throw RimeDepotUnsupportedError(
+                    "Archive mode supports owner/repository, a GitHub repository URL, or an explicit .zip URL; enable Git or provide a .zip URL."
+                )
             }
             repo := RegExReplace(repo, "i)^https?://github\.com/", "")
             repo := RegExReplace(repo, "/(?:tree|commit)/.*$", "")
+            repo := RegExReplace(repo, "[?#].*$", "")
             repo := RegExReplace(repo, "i)\.git$", "")
+        } else if repo ~= "i)^(?:ssh://|git@)" {
+            throw RimeDepotUnsupportedError(
+                "Archive mode does not accept Git transport URLs; enable Git or provide an explicit .zip URL."
+            )
         }
         repo := Trim(repo, " /\\")
-        if repo = "" || !InStr(repo, "/") {
-            throw RimeDepotTargetError("A GitHub archive requires an owner/repository target: " . repo)
+        if !RegExMatch(repo, "^[^/\\\s]+/[^/\\\s]+$") {
+            throw RimeDepotTargetError(
+                "Archive mode requires an owner/repository target, a GitHub repository URL, or an explicit .zip URL: " . repo
+            )
         }
         if ref = "" {
             ; GitHub resolves this endpoint to the repository's default
@@ -34,14 +46,30 @@ class RimeDepotArchive {
             ; a literal branch named HEAD.
             return "https://github.com/" . repo . "/archive/HEAD.zip"
         }
-        ref := RimeDepotArchive.UrlEncodePath(String(ref))
-        if ref ~= "i)^[0-9a-f]{7,40}$" {
+        ref := String(ref)
+        ref_kind := StrLower(String(ref_kind))
+        if ref_kind = "commit" {
+            ref_kind := "sha"
+        }
+        if ref_kind = "" {
+            ref_kind := ref ~= "i)^[0-9a-f]{7,40}$" ? "sha" : "branch"
+        }
+        if ref_kind != "branch" && ref_kind != "tag" && ref_kind != "sha" {
+            throw RimeDepotTargetError("Unsupported Git ref kind for archive: " . ref_kind)
+        }
+        RimeDepotUtil.ValidateRef(ref, ref_kind = "sha")
+        ref := this.UrlEncodePath(ref)
+        if ref_kind = "sha" {
             return "https://github.com/" . repo . "/archive/" . ref . ".zip"
         }
-        if StrLower(ref_kind) = "tag" {
+        if ref_kind = "tag" {
             return "https://github.com/" . repo . "/archive/refs/tags/" . ref . ".zip"
         }
         return "https://github.com/" . repo . "/archive/refs/heads/" . ref . ".zip"
+    }
+
+    static IsExplicitZipUrl(value) {
+        return String(value) ~= "i)^https?://[^\s]+\.zip(?:[?#][^\s]*)?$"
     }
 
     static DownloadAndExtractAsync(client, archive_url, staging_root, job, callback, proxy := "", shell_factory := 0) {
@@ -106,12 +134,13 @@ class RimeDepotArchive {
         count := NumGet(data, eocd + 10, "UShort")
         directory_size := NumGet(data, eocd + 12, "UInt")
         directory_offset := NumGet(data, eocd + 16, "UInt")
-        if directory_offset + directory_size > size {
+        directory_end := directory_offset + directory_size
+        if directory_end > size {
             throw RimeDepotSecurityError("ZIP central directory lies outside the archive.")
         }
         offset := directory_offset
         Loop count {
-            if offset + 46 > size || NumGet(data, offset, "UInt") != 0x02014B50 {
+            if offset + 46 > directory_end || NumGet(data, offset, "UInt") != 0x02014B50 {
                 throw RimeDepotSecurityError("Invalid ZIP central directory entry.")
             }
             flags := NumGet(data, offset + 8, "UShort")
@@ -122,7 +151,7 @@ class RimeDepotArchive {
             if (flags & 1) || (compression != 0 && compression != 8) {
                 throw RimeDepotUnsupportedError("Encrypted or unsupported ZIP compression is not allowed.")
             }
-            if offset + 46 + name_length + extra_length + comment_length > size {
+            if offset + 46 + name_length + extra_length + comment_length > directory_end {
                 throw RimeDepotSecurityError("ZIP entry exceeds the central directory.")
             }
             Loop name_length {
@@ -223,9 +252,28 @@ class RimeDepotArchive {
     }
 
     static UrlEncodePath(value) {
-        ; Ref names are normally branch/tag/SHA identifiers.  Keep the common
-        ; safe set readable and percent-encode path separators/spaces.
-        return RegExReplace(value, "[^A-Za-z0-9._~!$&'()+,;=@-]", (match) => Format("%{:02X}", Ord(match[0])))
+        ; RegExReplace(Func) is not available on all supported AHK v2 builds.
+        ; Encode UTF-8 bytes explicitly so spaces, slash separators and
+        ; non-ASCII branch/tag names cannot alter the archive URL path.
+        value := String(value)
+        byte_count := StrPut(value, "UTF-8") - 1
+        if byte_count <= 0 {
+            return ""
+        }
+        data := Buffer(byte_count)
+        StrPut(value, data, "UTF-8")
+        result := ""
+        Loop byte_count {
+            byte := NumGet(data, A_Index - 1, "UChar")
+            char := Chr(byte)
+            if byte >= 0x30 && byte <= 0x39 || byte >= 0x41 && byte <= 0x5A
+                || byte >= 0x61 && byte <= 0x7A || InStr("._~!$&'()+,;=@-", char) {
+                result .= char
+            } else {
+                result .= "%" . Format("{:02X}", byte)
+            }
+        }
+        return result
     }
 }
 

@@ -21,13 +21,19 @@ GUI and INI use the same six fields:
 | `RimeDirectory` | Rime user directory used as the installation destination |
 | `RppiIndexUrl` | Root RPPI index URL |
 | `Proxy` | Optional HTTP(S) proxy |
-| `UseGit` | Explicitly enable the Git installation path (`0`/`1`) |
-| `GitPath` | Direct `git.exe` path; empty resolves through `PATH` |
+| `UseGit` | Direct-install default: explicitly enable the Git path (`0`/`1`); RPPI catalog installs always use archives |
+| `GitPath` | Direct-install `git.exe` path; empty resolves through `PATH` |
 
 API values override INI values. Git path resolution is API, then INI, then
-`PATH`; only a direct `git.exe` is accepted. Git operations use argument
-arrays and never invoke a command shell, shell evaluation, or recipe commands.
-Branches, tags, and full commit SHAs are supported, including submodules.
+`PATH`; only a direct `git.exe` is accepted. The standalone GUI has an RPPI
+catalog mode and a Direct install mode. Direct mode accepts an owner/repository,
+GitHub repository URL, or explicit HTTP(S) `.zip` URL, with default/branch/tag/
+commit-SHA selection and an optional named recipe. An empty recipe selects the
+repository-root `recipe.yaml` automatically. RPPI selections always call the
+archive path, regardless of the direct-install `UseGit` preference. Git
+operations use argument arrays and never invoke a command shell, shell
+evaluation, or recipe commands. Branches, tags, and full commit SHAs are
+supported, including submodules.
 
 ## Public API
 

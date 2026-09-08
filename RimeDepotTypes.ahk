@@ -175,6 +175,7 @@ class RimeDepotCatalogEntry {
         this.Branch := ""
         this.Tag := ""
         this.Sha := ""
+        this.RefKind := ""
         this.Labels := []
         this.Category := ""
         this.CategoryPath := ""
@@ -209,8 +210,17 @@ class RimeDepotCatalogEntry {
         this.Tag := RimeDepotUtil.GetString(value, ["tag", "Tag"], "")
         this.Sha := RimeDepotUtil.GetString(value, ["sha", "SHA", "commit", "revision"], "")
         this.Ref := RimeDepotUtil.GetString(value, ["ref", "Ref"], "")
+        this.RefKind := StrLower(RimeDepotUtil.GetString(value, ["ref_kind", "refKind", "kind"], ""))
         if this.Branch = "" && this.Tag = "" && this.Sha = "" && this.Ref != "" {
-            if this.Ref ~= "i)^[0-9a-f]{7,40}$" {
+            if this.RefKind = "commit" || this.RefKind = "sha" {
+                this.Sha := this.Ref
+            } else if this.RefKind = "tag" {
+                this.Tag := this.Ref
+            } else if this.RefKind = "branch" {
+                this.Branch := this.Ref
+            } else if this.Ref ~= "i)^[0-9a-f]{7,40}$" {
+                ; RPPI records historically used only `ref`.  Preserve the
+                ; existing SHA shorthand convention even without ref_kind.
                 this.Sha := this.Ref
             } else {
                 this.Branch := this.Ref
@@ -227,6 +237,12 @@ class RimeDepotCatalogEntry {
         }
         this.Url := RimeDepotUtil.GetString(value, ["url", "homepage", "web"], "")
         this.ArchiveUrl := RimeDepotUtil.GetString(value, ["archive", "archiveUrl", "archive_url"], "")
+        if this.RefKind = "commit" {
+            this.RefKind := "sha"
+        }
+        if this.RefKind = "" {
+            this.RefKind := this.Branch != "" ? "branch" : (this.Tag != "" ? "tag" : (this.Sha != "" ? "sha" : ""))
+        }
         this.Description := RimeDepotUtil.GetString(value, ["description", "summary"], "")
         this.License := RimeDepotUtil.GetString(value, ["license", "licence"], "")
         this.IndexUrl := RimeDepotUtil.GetString(value, ["indexUrl", "index_url", "sourceIndex"], "")
@@ -260,6 +276,7 @@ class RimeDepotCatalogEntry {
             "branch", this.Branch,
             "tag", this.Tag,
             "sha", this.Sha,
+            "ref_kind", this.RefKind,
             "labels", this.Labels,
             "category", this.Category,
             "category_path", this.CategoryPath,
@@ -272,6 +289,8 @@ class RimeDepotCatalogEntry {
             "description", this.Description,
             "indexUrl", this.IndexUrl,
             "source", this.Source,
+            "url", this.Url,
+            "archiveUrl", this.ArchiveUrl,
             "raw", this.Raw
         )
     }
@@ -280,39 +299,116 @@ class RimeDepotCatalogEntry {
 /** Parsed install target, including an optional branch/tag/SHA and recipe. */
 class RimeDepotTarget {
     __New(value := "", ref := "", recipe := "", parameters := 0) {
-        this.Raw := String(value)
+        ; Maps/objects are the structured API.  String(Map()) is not a useful
+        ; representation in AHK v2 and, more importantly, would discard URL
+        ; and archive fields before they reach the installer.
+        this.Raw := IsObject(value) && !(value is String)
+            ? RimeDepotUtil.GetString(value, ["raw", "Raw"], "") : String(value)
         this.RawBase := ""
         this.Name := ""
         this.Repo := ""
+        this.SourceExplicit := false
+        this.ArchiveUrl := ""
         this.Ref := ref
         this.Branch := ""
         this.Tag := ""
         this.Sha := ""
+        this.RefKind := ""
         this.Recipe := recipe
         this.Parameters := parameters is Map ? parameters : Map()
         this.Options := Map()
 
         if IsObject(value) && !(value is String) {
             this.Name := RimeDepotUtil.GetString(value, ["name", "Name", "id", "Id"], "")
-            this.Repo := RimeDepotUtil.GetString(value, ["repo", "repository", "Repo"], "")
-            this.Ref := RimeDepotUtil.GetString(value, ["ref", "branch", "tag", "sha"], this.Ref)
+            this.Repo := RimeDepotUtil.GetString(value, ["repo", "repository", "Repo", "source"], "")
+            source_url := RimeDepotUtil.GetString(value, ["url", "URL"], "")
+            this.ArchiveUrl := RimeDepotUtil.GetString(value, ["archive", "archiveUrl", "archive_url"], "")
+            this.SourceExplicit := this.Repo != "" || source_url != "" || this.ArchiveUrl != ""
+            if this.Repo = "" {
+                this.Repo := source_url
+            }
+            if this.ArchiveUrl = "" && this.Repo != "" && RimeDepotTarget.IsArchiveUrl(this.Repo) {
+                this.ArchiveUrl := this.Repo
+            }
+            if this.Repo = "" && this.ArchiveUrl != "" {
+                ; An explicit archive is a complete direct source even when
+                ; no repository display name was supplied.
+                this.Repo := this.ArchiveUrl
+            }
+            if this.ArchiveUrl = "" && source_url != "" && RimeDepotTarget.IsArchiveUrl(source_url) {
+                this.ArchiveUrl := source_url
+            }
+            this.RefKind := StrLower(RimeDepotUtil.GetString(value, ["ref_kind", "refKind", "kind"], ""))
+            branch := RimeDepotUtil.GetString(value, ["branch", "Branch"], "")
+            tag := RimeDepotUtil.GetString(value, ["tag", "Tag"], "")
+            sha := RimeDepotUtil.GetString(value, ["sha", "SHA", "commit", "revision"], "")
+            explicit_ref := RimeDepotUtil.GetString(value, ["ref", "Ref"], "")
+            if sha != "" {
+                this.Ref := sha
+                this.RefKind := "sha"
+            } else if tag != "" {
+                this.Ref := tag
+                this.RefKind := "tag"
+            } else if branch != "" {
+                this.Ref := branch
+                this.RefKind := "branch"
+            } else if explicit_ref != "" {
+                this.Ref := explicit_ref
+            }
             this.Recipe := RimeDepotUtil.GetString(value, ["recipe", "Recipe"], this.Recipe)
             parameters_value := RimeDepotUtil.GetValue(value, ["parameters", "options"], 0)
             if IsObject(parameters_value) && !(parameters_value is Array) {
                 this.Parameters := parameters_value
             }
-            this.RawBase := this.Name != "" ? this.Name : this.Repo
+            this.Options := this.Parameters
+            if this.RefKind = "" {
+                this.RefKind := this.Ref != "" && this.Ref ~= "i)^[0-9a-f]{7,40}$" ? "sha"
+                    : (this.Ref != "" ? "branch" : "default")
+            }
+            if this.RefKind = "commit" {
+                this.RefKind := "sha"
+            }
+            if this.RefKind != "" && this.RefKind != "default" && this.Ref = "" {
+                throw RimeDepotTargetError("A Git ref kind requires a ref value.")
+            }
+            if this.RefKind != "default" && this.RefKind != "" {
+                if this.RefKind != "branch" && this.RefKind != "tag" && this.RefKind != "sha" {
+                    throw RimeDepotTargetError("Unsupported Git ref kind: " . this.RefKind)
+                }
+            }
+            if this.RefKind = "sha" && this.Ref != "" {
+                this.Sha := this.Ref
+            } else if this.RefKind = "tag" && this.Ref != "" {
+                this.Tag := this.Ref
+            } else if this.RefKind = "branch" && this.Ref != "" {
+                this.Branch := this.Ref
+            } else if this.Ref != "" {
+                throw RimeDepotTargetError("A Git ref kind requires a ref value.")
+            }
+            this.RawBase := this.Repo != "" ? this.Repo : this.Name
             if this.RawBase = "" {
                 throw RimeDepotTargetError("An install target must specify a package name or repository.")
             }
-            if this.Ref ~= "i)^[0-9a-f]{7,40}$" {
-                this.Sha := this.Ref
-            } else if RimeDepotUtil.GetString(value, ["tag", "Tag"], "") != "" {
-                this.Tag := this.Ref
-            } else {
-                this.Branch := this.Ref
+            if this.Ref != "" {
+                RimeDepotUtil.ValidateRef(this.Ref, this.Sha != "")
+            }
+            return
+        }
+        if RimeDepotTarget.IsStructuredUrl(String(value)) {
+            this.Repo := String(value)
+            this.SourceExplicit := true
+            this.RawBase := this.Repo
+            this.RefKind := this.Ref != "" ? (this.Ref ~= "i)^[0-9a-f]{7,40}$" ? "sha" : "branch") : "default"
+            this.Name := this.Repo
+            if RimeDepotTarget.IsArchiveUrl(this.Repo) {
+                this.ArchiveUrl := this.Repo
             }
             if this.Ref != "" {
+                if this.RefKind = "sha" {
+                    this.Sha := this.Ref
+                } else {
+                    this.Branch := this.Ref
+                }
                 RimeDepotUtil.ValidateRef(this.Ref, this.Sha != "")
             }
             return
@@ -363,10 +459,15 @@ class RimeDepotTarget {
         this.RawBase := base
         this.Name := base
         this.Repo := base
+        this.SourceExplicit := InStr(base, "/") > 0
         if this.Ref ~= "i)^[0-9a-f]{7,40}$" {
             this.Sha := this.Ref
+            this.RefKind := "sha"
         } else if this.Ref {
             this.Branch := this.Ref
+            this.RefKind := "branch"
+        } else {
+            this.RefKind := "default"
         }
     }
 
@@ -382,6 +483,17 @@ class RimeDepotTarget {
             }
         }
         return result
+    }
+
+    static IsStructuredUrl(value) {
+        value := String(value)
+        return value ~= "i)^https?://[^\s]+$"
+            || value ~= "i)^ssh://[^\s]+$"
+            || value ~= "i)^git@[^:\s]+:[^\s]+$"
+    }
+
+    static IsArchiveUrl(value) {
+        return String(value) ~= "i)^https?://[^\s]+\.zip(?:[?#][^\s]*)?$"
     }
 }
 

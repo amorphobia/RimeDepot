@@ -220,7 +220,12 @@ class RimeDepotGitClient {
 
     static RepoUrl(repo) {
         repo := String(repo)
-        if RimeDepotUtil.IsUrl(repo) || repo ~= "i)^git@[^:]+:" {
+        if repo ~= "i)^(?:https?://|ssh://|git@)[^\s]*\.zip(?:[?#][^\s]*)?$" {
+            throw RimeDepotUnsupportedError(
+                "Git mode cannot install an explicit .zip URL; disable Git or provide a repository URL."
+            )
+        }
+        if RimeDepotUtil.IsUrl(repo) || repo ~= "i)^(?:ssh://|git@[^:]+:)" {
             return repo
         }
         repo := Trim(repo, " /\\")

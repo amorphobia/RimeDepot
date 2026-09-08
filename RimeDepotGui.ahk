@@ -154,6 +154,7 @@ class RimeDepotGui extends Gui {
         this.settings_path := settings_path ? settings_path : A_ScriptDir . "\RimeDepot.ini"
         this.active_job := 0
         this.active_kind := ""
+        this.mode := "rppi"
         this.callbacks := 0
         this.operation_token := 0
         this.catalog_entries := []
@@ -169,6 +170,7 @@ class RimeDepotGui extends Gui {
         this.CreateControls()
         this.LoadSettingsIntoControls()
         this.ApplyServiceSettings()
+        this.SetMode("rppi")
         this.OnEvent("Close", this.OnClose.Bind(this))
         this.OnEvent("Escape", this.OnClose.Bind(this))
     }
@@ -194,7 +196,7 @@ class RimeDepotGui extends Gui {
         this.AddText("x648 y78 w68 h24 +0x200", "Proxy")
         this.proxy_edit := this.AddEdit("x720 y74 w296 h26")
 
-        this.use_git_checkbox := this.AddCheckbox("x28 y114 w110 h26", "Use Git")
+        this.use_git_checkbox := this.AddCheckbox("x28 y114 w120 h26", "Use Git (direct)")
         this.use_git_checkbox.OnEvent("Click", this.OnUseGitChanged.Bind(this))
         this.AddText("x152 y118 w68 h24 +0x200", "Git path")
         this.git_path_edit := this.AddEdit("x224 y114 w406 h26")
@@ -205,10 +207,15 @@ class RimeDepotGui extends Gui {
         this.save_settings_button := this.AddButton("x938 y112 w78 h28 +0x2000", "Save")
         this.save_settings_button.OnEvent("Click", this.SaveSettings.Bind(this))
 
-        this.AddText("x22 y198 w54 h24 +0x200", "Search")
+        this.mode_label := this.AddText("x28 y150 w76 h24 +0x200", "Mode")
+        this.mode_selector := this.AddDropDownList("x110 y146 w210 h26 Choose1", ["RPPI catalog", "Direct install"])
+        this.mode_selector.OnEvent("Change", this.OnModeChanged.Bind(this))
+        this.mode_dropdown := this.mode_selector
+
+        this.search_label := this.AddText("x22 y198 w54 h24 +0x200", "Search")
         this.search_edit := this.AddEdit("x78 y194 w280 h26")
         this.search_edit.OnEvent("Change", this.OnFilterChanged.Bind(this))
-        this.AddText("x378 y198 w66 h24 +0x200", "Category")
+        this.category_label := this.AddText("x378 y198 w66 h24 +0x200", "Category")
         this.category_filter := this.AddDropDownList("x448 y194 w210 h26 Choose1", ["All categories"])
         this.category_filter.OnEvent("Change", this.OnFilterChanged.Bind(this))
         this.refresh_button := this.AddButton("x774 y194 w94 h28 +0x2000", "Refresh index")
@@ -239,6 +246,43 @@ class RimeDepotGui extends Gui {
         this.detail_reverse_dependencies := this.AddText("x28 y632 w1020 h22", "Reverse dependencies: ")
         this.detail_labels := this.AddText("x28 y656 w760 h22", "Labels: ")
         this.detail_license := this.AddText("x802 y656 w236 h22", "License: ")
+
+        this.direct_group := this.AddGroupBox("x12 y184 w1056 h154", "Direct source")
+        this.direct_source_label := this.AddText("x22 y198 w54 h24 +0x200", "Source")
+        this.direct_source_edit := this.AddEdit("x78 y194 w780 h26")
+        this.direct_source_edit.OnEvent("Change", this.OnDirectInputChanged.Bind(this))
+        this.direct_ref_kind_label := this.AddText("x22 y238 w54 h24 +0x200", "Ref kind")
+        this.direct_ref_kind := this.AddDropDownList(
+            "x78 y234 w180 h26 Choose1", ["Default", "Branch", "Tag", "Commit SHA"]
+        )
+        this.direct_ref_label := this.AddText("x270 y238 w54 h24 +0x200", "Ref")
+        this.direct_ref_edit := this.AddEdit("x330 y234 w528 h26")
+        this.direct_recipe_label := this.AddText("x22 y278 w54 h24 +0x200", "Recipe")
+        this.direct_recipe_edit := this.AddEdit("x78 y274 w780 h26")
+        this.direct_recipe_hint := this.AddText(
+            "x22 y306 w1034 h24 cGray", "Leave Recipe empty to use the repository root recipe.yaml automatically."
+        )
+        ; Keep both names available to small hosts and hidden GUI tests: the
+        ; field is a repository source, which may also be an explicit .zip URL.
+        this.direct_repo_edit := this.direct_source_edit
+        this.direct_source := this.direct_source_edit
+        this.direct_ref := this.direct_ref_edit
+        this.direct_recipe := this.direct_recipe_edit
+        this.direct_ref_kind_dropdown := this.direct_ref_kind
+        this.direct_install_button := this.install_button
+
+        this.rppi_controls := [
+            this.search_label, this.search_edit, this.category_label, this.category_filter,
+            this.refresh_button, this.catalog_list, this.details_group, this.detail_title,
+            this.detail_summary, this.detail_schemas, this.detail_dependencies,
+            this.detail_reverse_dependencies, this.detail_labels, this.detail_license
+        ]
+        this.direct_controls := [
+            this.direct_group, this.direct_source_label, this.direct_source_edit,
+            this.direct_ref_kind_label, this.direct_ref_kind, this.direct_ref_label,
+            this.direct_ref_edit, this.direct_recipe_label, this.direct_recipe_edit,
+            this.direct_recipe_hint
+        ]
 
         this.status_text := this.AddText("x22 y692 w700 h22 cGray", "Ready.")
         this.progress_bar := this.AddProgress("x730 y694 w328 h18", 0)
@@ -347,13 +391,66 @@ class RimeDepotGui extends Gui {
         this.UpdateGitPathState()
     }
 
+    OnModeChanged(ctrl, index := 0, *) {
+        local selected
+        if !IsObject(ctrl) {
+            return false
+        }
+        selected := IsNumber(index) && index >= 1 && index <= 2 ? index : ctrl.Value
+        return this.SetMode(selected = 2 ? "direct" : "rppi")
+    }
+
+    SetMode(mode) {
+        local direct := mode = 2 || StrLower(String(mode)) = "direct"
+        if this.busy && ((direct && this.mode != "direct") || (!direct && this.mode != "rppi")) {
+            return false
+        }
+        this.mode := direct ? "direct" : "rppi"
+        if IsObject(this.mode_selector) && this.mode_selector.Value != (direct ? 2 : 1) {
+            this.mode_selector.Choose(direct ? 2 : 1)
+        }
+        for _, control in this.rppi_controls {
+            control.Visible := !direct
+        }
+        for _, control in this.direct_controls {
+            control.Visible := direct
+        }
+        this.install_button.Text := direct ? "Install direct" : "Install"
+        if direct {
+            this.install_button.Enabled := !this.busy && Trim(this.direct_source_edit.Value) != ""
+        } else {
+            this.SyncCatalogSelection()
+        }
+        this.UpdateGitPathState()
+        return true
+    }
+
+    SyncCatalogSelection() {
+        local row := this.catalog_list.GetNext(0)
+        if row > 0 && this.visible_entries.Has(row) {
+            this.ShowDetails(this.visible_entries[row])
+        } else {
+            this.ClearDetails()
+        }
+        this.install_button.Enabled := !this.busy && row > 0
+    }
+
     UpdateGitPathState() {
         local enabled := !this.busy && !!this.use_git_checkbox.Value
         this.git_path_edit.Enabled := enabled
         this.git_path_browse_button.Enabled := enabled
     }
 
+    OnDirectInputChanged(*) {
+        if this.mode = "direct" {
+            this.install_button.Enabled := !this.busy && Trim(this.direct_source_edit.Value) != ""
+        }
+    }
+
     RefreshCatalog(*) {
+        if this.mode != "rppi" {
+            return false
+        }
         this.StartCatalogLoad(true)
     }
 
@@ -374,7 +471,7 @@ class RimeDepotGui extends Gui {
             this.active_kind := "catalog"
             this.progress_bar.Value := 0
             this.SetStatus(force_refresh ? "Refreshing RPPI index…" : "Loading RPPI index…")
-            callbacks := this.CreateCallbacks(token)
+            callbacks := this.CreateCallbacks(token, "catalog")
             this.callbacks := callbacks
             this.SetBusy(true)
             this.active_job := force_refresh
@@ -382,6 +479,14 @@ class RimeDepotGui extends Gui {
                 : this.service.LoadCatalog(callbacks)
             if !IsObject(this.active_job) {
                 throw Error("The catalog operation did not return a RimeDepotJob.")
+            }
+            ; A service/test transport may complete synchronously before the
+            ; call returns.  The completion/error callback then runs while
+            ; active_job still points at the previous operation; re-check the
+            ; returned job here so the completed object cannot remain stuck in
+            ; the GUI's active state.
+            if HasMethod(this.active_job, "IsDone") && this.active_job.IsDone() {
+                this.FinishOperation(token)
             }
             return true
         } catch as err {
@@ -391,14 +496,18 @@ class RimeDepotGui extends Gui {
         }
     }
 
-    CreateCallbacks(token) {
+    CreateCallbacks(token, kind := "catalog") {
         this.progress_callback := this.OnProgress.Bind(this, token)
-        this.complete_callback := this.OnCatalogComplete.Bind(this, token)
+        this.complete_callback := kind = "install"
+            ? this.OnInstallComplete.Bind(this, token) : this.OnCatalogComplete.Bind(this, token)
         this.error_callback := this.OnOperationError.Bind(this, token)
         return RimeDepotCallbacks(this.progress_callback, this.complete_callback, this.error_callback)
     }
 
     InstallSelected(*) {
+        if this.mode = "direct" {
+            return this.InstallDirect()
+        }
         local row := this.catalog_list.GetNext(0), entry, token, callbacks
         if this.disposed || this.busy || row < 1 || !this.visible_entries.Has(row) {
             return false
@@ -410,17 +519,79 @@ class RimeDepotGui extends Gui {
             this.active_kind := "install"
             this.progress_bar.Value := 0
             this.SetStatus("Installing " . RimeDepotGuiEntryText(entry, ["name", "Name"], "selected scheme") . "…")
-            callbacks := this.CreateCallbacks(token)
+            callbacks := this.CreateCallbacks(token, "install")
             this.callbacks := callbacks
             this.SetBusy(true)
-            this.active_job := this.service.InstallEntry(entry, callbacks)
+            this.active_job := this.service.InstallEntry(entry,
+                Map("UseGit", false, "Proxy", this.proxy_edit.Value), callbacks)
             if !IsObject(this.active_job) {
                 throw Error("The install operation did not return a RimeDepotJob.")
+            }
+            if HasMethod(this.active_job, "IsDone") && this.active_job.IsDone() {
+                this.FinishOperation(token)
             }
             return true
         } catch as err {
             this.FinishOperation(token ?? this.operation_token)
             this.SetStatus("Could not start installation: " . RimeDepotGuiErrorText(err), true)
+            return false
+        }
+    }
+
+    InstallDirect(*) {
+        local source := Trim(this.direct_source_edit.Value), kind_index, kind, ref, recipe
+        local target, options, token, callbacks
+        if this.disposed || this.busy {
+            return false
+        }
+        if source = "" {
+            this.SetStatus("Direct source is required.", true)
+            return false
+        }
+        kind_index := this.direct_ref_kind.Value
+        kind := ["default", "branch", "tag", "sha"][kind_index]
+        ref := Trim(this.direct_ref_edit.Value)
+        recipe := Trim(this.direct_recipe_edit.Value)
+        if kind = "default" && ref != "" {
+            this.SetStatus("Choose Branch, Tag, or Commit SHA before entering a ref.", true)
+            return false
+        }
+        if kind != "default" && ref = "" {
+            this.SetStatus("Enter a ref for the selected direct-install ref kind.", true)
+            return false
+        }
+        target := Map("repo", source, "ref_kind", kind)
+        if kind != "default" {
+            target["ref"] := ref
+        }
+        if recipe != "" {
+            target["recipe"] := recipe
+        }
+        try {
+            ; Construct once at the GUI boundary for friendly validation, but
+            ; pass the structured Map to the service so URL fields are not
+            ; routed through the legacy colon compact parser.
+            RimeDepotTarget(target)
+            this.operation_token += 1
+            token := this.operation_token
+            this.active_kind := "install"
+            this.progress_bar.Value := 0
+            this.SetStatus("Installing direct source…")
+            callbacks := this.CreateCallbacks(token, "install")
+            this.callbacks := callbacks
+            this.SetBusy(true)
+            options := Map("UseGit", !!this.use_git_checkbox.Value, "Proxy", this.proxy_edit.Value)
+            this.active_job := this.service.InstallTarget(target, options, callbacks)
+            if !IsObject(this.active_job) {
+                throw Error("The direct install operation did not return a RimeDepotJob.")
+            }
+            if HasMethod(this.active_job, "IsDone") && this.active_job.IsDone() {
+                this.FinishOperation(token)
+            }
+            return true
+        } catch as err {
+            this.FinishOperation(token ?? this.operation_token)
+            this.SetStatus("Could not start direct installation: " . RimeDepotGuiErrorText(err), true)
             return false
         }
     }
@@ -501,6 +672,18 @@ class RimeDepotGui extends Gui {
         }
     }
 
+    OnInstallComplete(token, job_or_result := 0, result_or_extra := 0, extra*) {
+        local result, entries, count
+        if this.disposed || token != this.operation_token {
+            return
+        }
+        result := RimeDepotGuiLooksLikeJob(job_or_result) ? result_or_extra : job_or_result
+        entries := RimeDepotGuiGetValue(result, ["entries", "Entries"], 0)
+        count := entries is Array ? entries.Length : 0
+        this.FinishOperation(token)
+        this.SetStatus(count > 0 ? "Installed " . count . " package(s)." : "Installation completed.")
+    }
+
     OnOperationError(token, job_or_error := 0, error_or_extra := 0, extra*) {
         local error_value, text
         if RimeDepotGuiLooksLikeJob(job_or_error) {
@@ -543,10 +726,15 @@ class RimeDepotGui extends Gui {
         this.rppi_index_url_edit.Enabled := enabled
         this.proxy_edit.Enabled := enabled
         this.use_git_checkbox.Enabled := enabled
+        this.mode_selector.Enabled := enabled
         this.save_settings_button.Enabled := enabled
         this.refresh_button.Enabled := enabled
-        this.install_button.Enabled := enabled && this.catalog_list.GetNext(0) > 0
+        this.install_button.Enabled := enabled && (this.mode = "direct"
+            ? Trim(this.direct_source_edit.Value) != "" : this.catalog_list.GetNext(0) > 0)
         this.cancel_button.Enabled := !!busy
+        for _, control in this.direct_controls {
+            control.Enabled := enabled
+        }
         this.UpdateGitPathState()
     }
 

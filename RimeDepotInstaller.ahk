@@ -129,32 +129,63 @@ class RimeDepotInstallerOperation {
     }
 
     _FetchEntry(entry, index) {
+        local ref_kind, target_ref, source_repo, archive_url, use_git, git_client, proxy
         this.CurrentSource := RimeDepotUtil.JoinPath(this.StageRoot, "source-" . index)
         RimeDepotUtil.EnsureDirectory(this.CurrentSource)
+        source_repo := entry.Repo
+        archive_url := entry.ArchiveUrl
         ref := entry.Branch != "" ? entry.Branch : (entry.Tag != "" ? entry.Tag : entry.Sha)
+        ref_kind := entry.RefKind != "" ? entry.RefKind
+            : (entry.Branch != "" ? "branch" : (entry.Tag != "" ? "tag" : (entry.Sha != "" ? "sha" : "default")))
         if this.Target is RimeDepotTarget && index = this.Plan.Length {
+            ; A package-id target may resolve through the catalog while still
+            ; carrying a parsed Repo field (for example "Openfly@branch").
+            ; Only an explicitly supplied direct source may replace the
+            ; catalog repository; ref/recipe/parameter overrides remain valid.
+            if this.Target.SourceExplicit && this.Target.Repo != "" {
+                source_repo := this.Target.Repo
+            }
+            if this.Target.ArchiveUrl != "" {
+                archive_url := this.Target.ArchiveUrl
+            }
             target_ref := this.Target.Ref
-            if target_ref != "" {
+            if this.Target.SourceExplicit && this.Target.RefKind = "default" {
+                ; A structured direct target with no ref explicitly asks for
+                ; the repository default, even if a matching RPPI entry has a
+                ; catalog-specific branch.
+                ref := ""
+                ref_kind := "default"
+            } else if target_ref != "" {
                 ref := target_ref
+                ref_kind := this.Target.RefKind != "" ? this.Target.RefKind
+                    : (this.Target.Sha != "" ? "sha" : (this.Target.Tag != "" ? "tag" : "branch"))
             }
         }
         this.Job.ReportProgress(Map("phase", "install", "state", "fetching", "entry", entry.Id,
             "index", index, "total", this.Plan.Length))
         use_git := RimeDepotUtil.GetValue(this.Options, ["UseGit", "use_git"], this.Config.UseGit)
         if use_git {
+            if RimeDepotArchive.IsExplicitZipUrl(archive_url) || RimeDepotArchive.IsExplicitZipUrl(source_repo) {
+                throw RimeDepotUnsupportedError(
+                    "Git mode cannot install an explicit .zip URL; disable Git or provide a repository URL."
+                )
+            }
             git_client := this.Installer.GitClient
             if !git_client || git_client.Config != this.Config {
                 git_client := RimeDepotGitClient(this.Config)
             }
-            this.CurrentRequest := git_client.FetchAsync(entry.Repo, this.CurrentSource, ref, this.Job,
+            this.CurrentRequest := git_client.FetchAsync(source_repo, this.CurrentSource, ref, this.Job,
                 ObjBindMethod(this, "_GitFetched", entry, index))
         } else {
-            if entry.Repo ~= "i)\.gitmodules$" {
+            if source_repo ~= "i)\.gitmodules$" {
                 throw RimeDepotUnsupportedError("HTTP package sources cannot be a .gitmodules repository.")
             }
-            archive_url := entry.ArchiveUrl
             if archive_url = "" {
-                archive_url := RimeDepotArchive.GitHubArchiveUrl(entry.Repo, ref)
+                archive_url := RimeDepotArchive.GitHubArchiveUrl(source_repo, ref, ref_kind)
+            } else if !RimeDepotArchive.IsExplicitZipUrl(archive_url) {
+                throw RimeDepotUnsupportedError(
+                    "Archive mode requires an explicit HTTP(S) .zip URL; enable Git for repository URLs."
+                )
             }
             proxy := RimeDepotUtil.GetString(this.Options, ["Proxy", "proxy"], this.Config.Proxy)
             this.CurrentRequest := RimeDepotArchive.DownloadAndExtractAsync(this.Client, archive_url, this.CurrentSource,
