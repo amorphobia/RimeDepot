@@ -27,9 +27,11 @@ RimeDepotGuiSmokeMain() {
     RunTest("RimeDepot GUI keeps details for the current selection", RimeDepotGuiSmokeSelection.Bind())
     RunTest("RimeDepot GUI switches RPPI and direct modes", RimeDepotGuiSmokeModes.Bind())
     RunTest("RimeDepot GUI builds hierarchical category filters", RimeDepotGuiSmokeCategories.Bind())
+    RunTest("RimeDepot GUI keeps category branches contiguous", RimeDepotGuiSmokeCategoryOrder.Bind())
     RunTest("RimeDepot GUI disambiguates duplicate category leaves", RimeDepotGuiSmokeCategoryNames.Bind())
     RunTest("RimeDepot GUI applies mode geometry and DDL row options", RimeDepotGuiSmokeGeometry.Bind())
     RunTest("RimeDepot GUI preserves filter state while busy", RimeDepotGuiSmokeBusy.Bind())
+    RunTest("RimeDepot GUI uses native determinate and marquee progress", RimeDepotGuiSmokeProgress.Bind())
     ExitApp(0)
 }
 
@@ -292,6 +294,62 @@ RimeDepotGuiSmokeCategories() {
     }
 }
 
+RimeDepotGuiSmokeCategoryOrder() {
+    local gui := RimeDepotGui(0, RimeDepotGuiSettings(), A_Temp . "\\RimeDepot-GuiSmoke-category-order.ini")
+    local entries := [
+        {category_path: "alpha / one", name: "Alpha one", repo: "owner/alpha-one"},
+        {category_path: "beta", name: "Beta", repo: "owner/beta"},
+        {category_path: "alpha / two / deep", name: "Alpha two deep", repo: "owner/alpha-two-deep"},
+        {category_path: "alpha / two", name: "Alpha two", repo: "owner/alpha-two"},
+        {category_path: "gamma", name: "Gamma", repo: "owner/gamma"},
+        {category_path: "alpha / one / deep", name: "Alpha one deep", repo: "owner/alpha-one-deep"}
+    ]
+    local expected_paths := [
+        "", "alpha", "alpha / one", "alpha / one / deep", "alpha / two", "alpha / two / deep", "beta", "gamma"
+    ]
+    local index, path, alpha_index, one_index, deep_index, selected_value, names
+    try {
+        gui.catalog_entries := entries
+        gui.UpdateCategoryFilter()
+        AssertEqual(expected_paths.Length, gui.category_paths.Length,
+            "The category tree omitted or invented a canonical path.")
+        for index, path in expected_paths {
+            AssertEqual(path, gui.category_paths[index],
+                "Category paths must be emitted in preorder with first-seen sibling order.")
+        }
+
+        alpha_index := RimeDepotGuiSmokeFindCategoryIndex(gui, "alpha")
+        one_index := RimeDepotGuiSmokeFindCategoryIndex(gui, "alpha / one")
+        deep_index := RimeDepotGuiSmokeFindCategoryIndex(gui, "alpha / two / deep")
+        gui.category_filter.Choose(alpha_index)
+        gui.RefreshCatalogView()
+        AssertEqual(4, gui.catalog_list.GetCount(), "Selecting a parent must include every descendant entry.")
+        names := gui.catalog_list.GetText(1, 2) . "|" . gui.catalog_list.GetText(2, 2)
+            . "|" . gui.catalog_list.GetText(3, 2) . "|" . gui.catalog_list.GetText(4, 2)
+        AssertTrue(InStr(names, "Alpha one") > 0 && InStr(names, "Alpha two deep") > 0
+            && InStr(names, "Alpha two") > 0 && InStr(names, "Alpha one deep") > 0
+            && InStr(names, "Beta") = 0 && InStr(names, "Gamma") = 0,
+            "Parent filtering did not follow the canonical subtree boundary.")
+
+        gui.category_filter.Choose(one_index)
+        gui.RefreshCatalogView()
+        AssertEqual(2, gui.catalog_list.GetCount(), "Selecting a branch must include only its own descendants.")
+        AssertTrue(InStr(gui.catalog_list.GetText(1, 2), "Alpha one") > 0
+            && InStr(gui.catalog_list.GetText(2, 2), "Alpha one deep") > 0,
+            "The branch filter included a sibling branch.")
+
+        gui.category_filter.Choose(deep_index)
+        selected_value := gui.category_filter.Value
+        gui.UpdateCategoryFilter()
+        AssertEqual(selected_value, gui.category_filter.Value,
+            "Rebuilding the preorder category list changed the selected value.")
+        AssertEqual("alpha / two / deep", gui.SelectedCategoryPath(),
+            "Rebuilding the category list did not preserve the canonical selection.")
+    } finally {
+        gui.Dispose()
+    }
+}
+
 RimeDepotGuiSmokeCategoryNames() {
     local gui := RimeDepotGui(RimeDepotGuiFakeService(), RimeDepotGuiSettings(),
         A_Temp . "\\RimeDepot-GuiSmoke-category-names.ini")
@@ -500,6 +558,89 @@ RimeDepotGuiSmokeBusy() {
     }
 }
 
+RimeDepotGuiSmokeProgress() {
+    local service := RimeDepotGuiFakeService()
+    local gui := RimeDepotGui(service, RimeDepotGuiSettings(), A_Temp . "\\RimeDepot-GuiSmoke-progress.ini")
+    local job, token, entry := {category_path: "demo", name: "Progress fixture", repo: "owner/progress"}
+    try {
+        ; RPPI and Direct share the same progress state machine.  Keep the
+        ; fake job from its delayed delivery while driving each callback here.
+        AssertTrue(gui.StartCatalogLoad(false), "The RPPI progress operation did not start.")
+        job := gui.active_job
+        token := gui.operation_token
+        job.delivered := true
+        AssertTrue(gui.busy && RimeDepotGuiSmokeProgressHasMarquee(gui.progress_bar),
+            "Operation start did not enable native marquee progress.")
+
+        gui.OnProgress(token, job, {phase: "fetching", state: "index"})
+        AssertTrue(RimeDepotGuiSmokeProgressHasMarquee(gui.progress_bar),
+            "An unknown stage payload did not keep native marquee progress active.")
+        gui.OnProgress(token, job, {percent: 25})
+        AssertTrue(!RimeDepotGuiSmokeProgressHasMarquee(gui.progress_bar)
+            && gui.progress_bar.Value = 25,
+            "A percent payload did not switch to determinate progress at 25.")
+        gui.OnProgress(token - 1, job, {percent: 75})
+        AssertTrue(!RimeDepotGuiSmokeProgressHasMarquee(gui.progress_bar)
+            && gui.progress_bar.Value = 25,
+            "A stale progress callback changed the current progress state.")
+        gui.OnProgress(token, job, {phase: "loading", state: "recipes"})
+        AssertTrue(RimeDepotGuiSmokeProgressHasMarquee(gui.progress_bar)
+            && gui.progress_bar.Value = 0,
+            "An unknown next stage did not reset to native marquee progress.")
+        gui.OnCatalogComplete(token, job, [entry])
+        AssertTrue(!gui.busy && !RimeDepotGuiSmokeProgressHasMarquee(gui.progress_bar)
+            && gui.progress_bar.Value = 100,
+            "Successful RPPI completion did not stop marquee at 100.")
+
+        gui.SetMode("direct")
+        gui.direct_source_edit.Value := "owner/direct-progress"
+        AssertTrue(gui.InstallDirect(), "The Direct progress operation did not start.")
+        job := gui.active_job
+        token := gui.operation_token
+        AssertTrue(gui.busy && RimeDepotGuiSmokeProgressHasMarquee(gui.progress_bar),
+            "Direct operation start did not enable native marquee progress.")
+        gui.OnProgress(token, job, {fraction: 0.25})
+        AssertTrue(!RimeDepotGuiSmokeProgressHasMarquee(gui.progress_bar)
+            && gui.progress_bar.Value = 25,
+            "A fraction payload did not switch Direct progress to determinate 25.")
+
+        job.delivered := true
+        gui.OnInstallComplete(token, job, Map("entries", []))
+        AssertTrue(!gui.busy && !RimeDepotGuiSmokeProgressHasMarquee(gui.progress_bar)
+            && gui.progress_bar.Value = 100,
+            "Successful Direct completion did not stop marquee at 100.")
+
+        AssertTrue(gui.InstallDirect(), "The Direct cancellation operation did not start.")
+        job := gui.active_job
+        token := gui.operation_token
+        AssertTrue(gui.busy && RimeDepotGuiSmokeProgressHasMarquee(gui.progress_bar),
+            "The second Direct operation did not re-enter native marquee progress.")
+        gui.OnProgress(token, job, {fraction: 0.25})
+        AssertTrue(gui.CancelActiveJob(), "The Direct progress cancellation did not start.")
+        AssertTrue(!gui.busy && !RimeDepotGuiSmokeProgressHasMarquee(gui.progress_bar)
+            && gui.progress_bar.Value = 0 && InStr(gui.status_text.Value, "Operation failed") > 0,
+            "Cancellation did not stop marquee and reset progress to zero.")
+
+        service.fail_install := true
+        AssertTrue(!gui.InstallDirect(), "The simulated Direct start failure unexpectedly succeeded.")
+        AssertTrue(!gui.busy && !RimeDepotGuiSmokeProgressHasMarquee(gui.progress_bar)
+            && gui.progress_bar.Value = 0,
+            "A Direct start failure did not stop marquee and reset progress.")
+    } finally {
+        gui.Dispose()
+    }
+}
+
+RimeDepotGuiSmokeProgressHasMarquee(control) {
+    local style
+    if A_PtrSize = 8 {
+        style := DllCall("GetWindowLongPtrW", "Ptr", control.Hwnd, "Int", -16, "Ptr")
+    } else {
+        style := DllCall("GetWindowLongW", "Ptr", control.Hwnd, "Int", -16, "Int")
+    }
+    return !!(style & 0x08)
+}
+
 class RimeDepotGuiFakeService {
     __New(synchronous_catalog := false, catalog_error := false) {
         this.config := 0
@@ -507,6 +648,7 @@ class RimeDepotGuiFakeService {
         this.calls := []
         this.synchronous_catalog := synchronous_catalog
         this.catalog_error := catalog_error
+        this.fail_install := false
     }
 
     Configure(values) {
@@ -545,6 +687,9 @@ class RimeDepotGuiFakeService {
         if !callbacks {
             callbacks := options
             options := Map()
+        }
+        if this.fail_install {
+            throw Error("simulated install start failure")
         }
         this.calls.Push({kind: "target", target: target, options: RimeDepotGuiFakeCopy(options)})
         return this._Install(callbacks, "target", target, options)

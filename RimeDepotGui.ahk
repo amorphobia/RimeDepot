@@ -140,6 +140,9 @@ class RimeDepotGui extends Gui {
     static WINDOW_WIDTH := 1080
     static RPPI_HEIGHT := 760
     static DIRECT_HEIGHT := 420
+    static PBS_MARQUEE := 0x08
+    static PBM_SETMARQUEE := 0x040A
+    static GWL_STYLE := -16
     ; Keep the old name as a compatibility alias for small hosts which used
     ; the original fixed-height constant.  Show() now chooses by mode.
     static WINDOW_HEIGHT := RimeDepotGui.RPPI_HEIGHT
@@ -168,6 +171,7 @@ class RimeDepotGui extends Gui {
         this.disposed := false
         this._shown := false
         this._hidden := false
+        this.progress_mode := "determinate"
         this.initial_load_started := false
         this.initial_load_callback := this.StartInitialLoad.Bind(this)
         this.progress_callback := 0
@@ -329,6 +333,94 @@ class RimeDepotGui extends Gui {
 
     ModeWindowHeight() {
         return this.mode = "direct" ? RimeDepotGui.DIRECT_HEIGHT : RimeDepotGui.RPPI_HEIGHT
+    }
+
+    BeginProgress() {
+        this.progress_bar.Value := 0
+        this.SetProgressMarquee(true)
+    }
+
+    SetProgressIndeterminate() {
+        if !this.ProgressIsMarquee() {
+            this.progress_bar.Value := 0
+        }
+        this.SetProgressMarquee(true)
+    }
+
+    SetProgressDeterminate(percent) {
+        this.SetProgressMarquee(false)
+        this.progress_bar.Value := percent
+    }
+
+    CompleteProgress() {
+        this.SetProgressMarquee(false)
+        this.progress_bar.Value := 100
+    }
+
+    ResetProgress() {
+        this.SetProgressMarquee(false)
+        this.progress_bar.Value := 0
+    }
+
+    ProgressIsMarquee() {
+        return !!(this.GetProgressStyle(this.progress_bar.Hwnd) & RimeDepotGui.PBS_MARQUEE)
+    }
+
+    SetProgressMarquee(enabled) {
+        local hwnd := this.progress_bar.Hwnd, style, result
+        if !hwnd {
+            this.progress_mode := "determinate"
+            return false
+        }
+        style := this.GetProgressStyle(hwnd)
+        if enabled {
+            if !(style & RimeDepotGui.PBS_MARQUEE) {
+                this.SetProgressStyle(hwnd, style | RimeDepotGui.PBS_MARQUEE)
+            }
+            style := this.GetProgressStyle(hwnd)
+            if !(style & RimeDepotGui.PBS_MARQUEE) {
+                this.progress_mode := "determinate"
+                return false
+            }
+            result := DllCall("SendMessageW", "Ptr", hwnd, "UInt", RimeDepotGui.PBM_SETMARQUEE,
+                "Ptr", 1, "Ptr", 30, "Ptr")
+            style := this.GetProgressStyle(hwnd)
+            if !result || !(style & RimeDepotGui.PBS_MARQUEE) {
+                if style & RimeDepotGui.PBS_MARQUEE {
+                    this.SetProgressStyle(hwnd, style & ~RimeDepotGui.PBS_MARQUEE)
+                }
+                this.progress_mode := "determinate"
+                return false
+            }
+            this.progress_mode := "marquee"
+            return true
+        }
+        DllCall("SendMessageW", "Ptr", hwnd, "UInt", RimeDepotGui.PBM_SETMARQUEE,
+            "Ptr", 0, "Ptr", 0, "Ptr")
+        if style & RimeDepotGui.PBS_MARQUEE {
+            this.SetProgressStyle(hwnd, style & ~RimeDepotGui.PBS_MARQUEE)
+        }
+        style := this.GetProgressStyle(hwnd)
+        this.progress_mode := style & RimeDepotGui.PBS_MARQUEE ? "marquee" : "determinate"
+        return !(style & RimeDepotGui.PBS_MARQUEE)
+    }
+
+    GetProgressStyle(hwnd) {
+        if A_PtrSize = 8 {
+            return DllCall("GetWindowLongPtrW", "Ptr", hwnd, "Int", RimeDepotGui.GWL_STYLE, "Ptr")
+        }
+        return DllCall("GetWindowLongW", "Ptr", hwnd, "Int", RimeDepotGui.GWL_STYLE, "Int")
+    }
+
+    SetProgressStyle(hwnd, style) {
+        if A_PtrSize = 8 {
+            DllCall("SetWindowLongPtrW", "Ptr", hwnd, "Int", RimeDepotGui.GWL_STYLE, "Ptr", style, "Ptr")
+        } else {
+            DllCall("SetWindowLongW", "Ptr", hwnd, "Int", RimeDepotGui.GWL_STYLE, "Int", style, "Int")
+        }
+        DllCall("SetWindowPos", "Ptr", hwnd, "Ptr", 0, "Int", 0, "Int", 0, "Int", 0, "Int", 0,
+            "UInt", 0x27)
+        DllCall("InvalidateRect", "Ptr", hwnd, "Ptr", 0, "Int", 1)
     }
 
     StartInitialLoad(*) {
@@ -516,7 +608,7 @@ class RimeDepotGui extends Gui {
             this.operation_token += 1
             token := this.operation_token
             this.active_kind := "catalog"
-            this.progress_bar.Value := 0
+            this.BeginProgress()
             this.SetStatus(force_refresh ? "Refreshing RPPI index…" : "Loading RPPI index…")
             callbacks := this.CreateCallbacks(token, "catalog")
             this.callbacks := callbacks
@@ -537,6 +629,7 @@ class RimeDepotGui extends Gui {
             }
             return true
         } catch as err {
+            this.ResetProgress()
             this.FinishOperation(token ?? this.operation_token)
             this.SetStatus("Could not start catalog operation: " . RimeDepotGuiErrorText(err), true)
             return false
@@ -564,7 +657,7 @@ class RimeDepotGui extends Gui {
             this.operation_token += 1
             token := this.operation_token
             this.active_kind := "install"
-            this.progress_bar.Value := 0
+            this.BeginProgress()
             this.SetStatus("Installing " . RimeDepotGuiEntryText(entry, ["name", "Name"], "selected scheme") . "…")
             callbacks := this.CreateCallbacks(token, "install")
             this.callbacks := callbacks
@@ -579,6 +672,7 @@ class RimeDepotGui extends Gui {
             }
             return true
         } catch as err {
+            this.ResetProgress()
             this.FinishOperation(token ?? this.operation_token)
             this.SetStatus("Could not start installation: " . RimeDepotGuiErrorText(err), true)
             return false
@@ -622,7 +716,7 @@ class RimeDepotGui extends Gui {
             this.operation_token += 1
             token := this.operation_token
             this.active_kind := "install"
-            this.progress_bar.Value := 0
+            this.BeginProgress()
             this.SetStatus("Installing direct source…")
             callbacks := this.CreateCallbacks(token, "install")
             this.callbacks := callbacks
@@ -637,6 +731,7 @@ class RimeDepotGui extends Gui {
             }
             return true
         } catch as err {
+            this.ResetProgress()
             this.FinishOperation(token ?? this.operation_token)
             this.SetStatus("Could not start direct installation: " . RimeDepotGuiErrorText(err), true)
             return false
@@ -688,7 +783,9 @@ class RimeDepotGui extends Gui {
         }
         percent := RimeDepotGuiProgressPercent(progress)
         if percent >= 0 {
-            this.progress_bar.Value := percent
+            this.SetProgressDeterminate(percent)
+        } else {
+            this.SetProgressIndeterminate()
         }
         text := RimeDepotGuiProgressText(progress, message)
         if text != "" {
@@ -717,6 +814,7 @@ class RimeDepotGui extends Gui {
         this.RefreshCatalogView()
         warning := RimeDepotGuiCatalogWarning(result, result_extra)
         count := entries.Length
+        this.CompleteProgress()
         this.FinishOperation(token)
         if warning != "" {
             this.SetStatus("Loaded " . count . " scheme(s). Warning: " . warning, true)
@@ -733,6 +831,7 @@ class RimeDepotGui extends Gui {
         result := RimeDepotGuiLooksLikeJob(job_or_result) ? result_or_extra : job_or_result
         entries := RimeDepotGuiGetValue(result, ["entries", "Entries"], 0)
         count := entries is Array ? entries.Length : 0
+        this.CompleteProgress()
         this.FinishOperation(token)
         this.SetStatus(count > 0 ? "Installed " . count . " package(s)." : "Installation completed.")
     }
@@ -751,6 +850,7 @@ class RimeDepotGui extends Gui {
         if this.disposed || token != this.operation_token {
             return
         }
+        this.ResetProgress()
         this.FinishOperation(token)
         this.SetStatus("Operation failed: " . text, true)
     }
@@ -763,6 +863,7 @@ class RimeDepotGui extends Gui {
         this.active_job := 0
         this.active_kind := ""
         this.callbacks := 0
+        this.SetProgressMarquee(false)
         this.SetBusy(false)
         if IsObject(callback_object) && HasMethod(callback_object, "Dispose") {
             try callback_object.Dispose()
@@ -865,29 +966,36 @@ class RimeDepotGui extends Gui {
 
     UpdateCategoryFilter() {
         local selected := this.SelectedCategoryPath()
-        local categories, paths := [""], seen := Map(), category, path, leaf
-        local parts, part, index, selected_index := 1, leaf_counts := Map()
-        seen[""] := true
+        local categories, paths, category_tree, category_node, category_child
+        local parts, part, path, index, selected_index := 1, leaf_counts := Map()
+        category_tree := Map("path", "", "children", Map(), "order", [])
         for entry in this.catalog_entries {
             category := this.CategoryPathForEntry(entry)
             parts := StrSplit(category, " / ")
-            path := ""
+            category_node := category_tree
             for _, part in parts {
-                path := path = "" ? part : path . " / " . part
-                if !seen.Has(path) {
-                    seen[path] := true
-                    paths.Push(path)
+                if part = "" {
+                    continue
                 }
+                if !category_node["children"].Has(part) {
+                    path := category_node["path"] = "" ? part : category_node["path"] . " / " . part
+                    category_child := Map("path", path, "children", Map(), "order", [])
+                    category_node["children"][part] := category_child
+                    category_node["order"].Push(part)
+                }
+                category_node := category_node["children"][part]
             }
         }
+        paths := [""]
+        this.AppendCategoryTreePreorder(category_tree, paths)
         this.category_paths := paths
         categories := ["All categories"]
         for index, path in paths {
             if index = 1 {
                 continue
             }
-            leaf := this.CategoryLeafName(path)
-            leaf_counts[leaf] := leaf_counts.Has(leaf) ? leaf_counts[leaf] + 1 : 1
+            category := this.CategoryLeafName(path)
+            leaf_counts[category] := leaf_counts.Has(category) ? leaf_counts[category] + 1 : 1
         }
         for index, path in paths {
             if index > 1 {
@@ -905,6 +1013,24 @@ class RimeDepotGui extends Gui {
             }
         }
         this.category_filter.Choose(selected_index)
+    }
+
+    AppendCategoryTreePreorder(root, paths) {
+        local stack := [Map("node", root, "index", 1)]
+        local frame, node, child_name, child
+        while stack.Length {
+            frame := stack[stack.Length]
+            node := frame["node"]
+            if frame["index"] > node["order"].Length {
+                stack.Pop()
+                continue
+            }
+            child_name := node["order"][frame["index"]]
+            frame["index"] += 1
+            child := node["children"][child_name]
+            paths.Push(child["path"])
+            stack.Push(Map("node", child, "index", 1))
+        }
     }
 
     RefreshCatalogView(*) {
@@ -998,6 +1124,7 @@ class RimeDepotGui extends Gui {
         }
         this.disposed := true
         SetTimer(this.initial_load_callback, 0)
+        this.ResetProgress()
         if IsObject(this.active_job) {
             try {
                 if HasMethod(this.active_job, "Cancel") {
