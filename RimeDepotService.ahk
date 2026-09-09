@@ -108,6 +108,7 @@ class RimeDepotService {
     }
 
     _LoadCatalog(options, callbacks, refresh) {
+        local job, config, cache, identity, snapshot, probe
         if options is RimeDepotCallbacks || IsObject(options) && HasMethod(options, "Call") {
             if !callbacks {
                 callbacks := options
@@ -124,14 +125,138 @@ class RimeDepotService {
         try {
             config := this.Config.With(options)
             cache := RimeDepotRppiCache(config.CachePath)
-            operation := RimeDepotRppiLoadOperation(this.Http, cache, config.RppiIndexUrl,
-                config.AsMap(), job, ObjBindMethod(this, "_CatalogDone", job, refresh))
-            job.SetCancelHandler(ObjBindMethod(operation, "Cancel"))
-            operation.Start()
+            identity := RimeDepotRppiVersionProbe.ParseRawGithubUrl(config.RppiIndexUrl)
+            ; Keep the last complete normalized generation available to every
+            ; full-load path, including RefreshCatalog.  A raw load is allowed
+            ; to use per-URL caches, but never to publish a mixed generation.
+            snapshot := cache.ReadSnapshot(config.RppiIndexUrl)
+            if !refresh && identity {
+                probe := RimeDepotRppiVersionProbe(this.Http, config.RppiIndexUrl, config.AsMap(), snapshot,
+                    ObjBindMethod(this, "_CatalogGateDone", job, config, cache, identity, snapshot), job)
+                job.SetCancelHandler(ObjBindMethod(probe, "Cancel"))
+                probe.Start()
+            } else {
+                this._StartCatalogLoad(job, config, cache, refresh, "", 0, false, snapshot)
+            }
         } catch as err {
             job.Fail(err)
         }
         return job
+    }
+
+    _StartCatalogLoad(job, config, cache, refresh, version_sha := "", probe_response := 0,
+        force_reload := false, prior_snapshot := 0) {
+        local operation
+        operation := RimeDepotRppiLoadOperation(this.Http, cache, config.RppiIndexUrl,
+            config.AsMap(), job, ObjBindMethod(this, "_CatalogDone", job, refresh, cache,
+                config.RppiIndexUrl, version_sha, probe_response, prior_snapshot),
+            refresh, force_reload)
+        job.SetCancelHandler(ObjBindMethod(operation, "Cancel"))
+        operation.Start()
+        return operation
+    }
+
+    _CatalogGateDone(job, config, cache, identity, snapshot, result) {
+        local version_sha, response, warning, force_reload
+        if job.IsDone() {
+            return
+        }
+        result := IsObject(result) ? result : Map("ok", false, "error", Error("Invalid commit probe result."))
+        if result["ok"] {
+            version_sha := RimeDepotUtil.GetString(result, ["sha"], "")
+            response := RimeDepotUtil.GetValue(result, ["response"], 0)
+            if snapshot && version_sha != "" && RimeDepotRppiVersionProbe.CanFastPath(
+                config.RppiIndexUrl, identity, snapshot, version_sha) {
+                try {
+                    cache.TouchSnapshot(config.RppiIndexUrl, snapshot, version_sha, response)
+                    this._CompleteSnapshotJob(job, snapshot)
+                } catch as err {
+                    try {
+                        this._StartCatalogLoad(job, config, cache, false, version_sha, response, false, snapshot)
+                    } catch as start_error {
+                        job.Fail(start_error)
+                    }
+                }
+                return
+            }
+            force_reload := snapshot && snapshot["VersionSha"] != ""
+                && StrLower(snapshot["VersionSha"]) != StrLower(version_sha)
+            try {
+                this._StartCatalogLoad(job, config, cache, false, version_sha, response, force_reload, snapshot)
+            } catch as err {
+                job.Fail(err)
+            }
+            return
+        }
+
+        if snapshot {
+            warning := this._SnapshotWarning(config.RppiIndexUrl, result)
+            try {
+                this._CompleteSnapshotJob(job, snapshot, warning)
+            } catch as err {
+                ; A corrupt snapshot is treated like a cache miss; preserve the
+                ; previous full-load behavior when local recovery is impossible.
+                try {
+                    this._StartCatalogLoad(job, config, cache, false, "", 0, false, 0)
+                } catch as start_error {
+                    job.Fail(start_error)
+                }
+            }
+            return
+        }
+        ; There is no trusted version yet.  Keep the old first-load behavior:
+        ; fetch every raw index and do not create a versioned snapshot.
+        try {
+            this._StartCatalogLoad(job, config, cache, false, "", 0, false, 0)
+        } catch as err {
+            job.Fail(err)
+        }
+    }
+
+    _CompleteSnapshotJob(job, snapshot, warning := 0) {
+        local catalog
+        if job.IsDone() {
+            return
+        }
+        catalog := RimeDepotCatalog.FromSnapshot(snapshot["Document"])
+        if warning {
+            catalog.Warnings.Push(warning)
+        }
+        this.Catalog := catalog
+        job.Complete(catalog)
+    }
+
+    _SnapshotWarning(root_url, result) {
+        local error, message
+        error := RimeDepotUtil.GetValue(result, ["error"], 0)
+        message := error && HasProp(error, "Message") ? error.Message : "Commit probe unavailable."
+        return Map(
+            "kind", "stale-snapshot",
+            "url", root_url,
+            "message", "Commit probe failed; using the last complete catalog snapshot.",
+            "error", message
+        )
+    }
+
+    _SnapshotLoadWarning(root_url, cause := 0) {
+        local error, message
+        error := cause
+        if cause is Map && cause.Has("error") {
+            error := cause["error"]
+        }
+        if error && HasProp(error, "Message") {
+            message := error.Message
+        } else if error && !IsObject(error) {
+            message := String(error)
+        } else {
+            message := "The raw catalog load was incomplete."
+        }
+        return Map(
+            "kind", "stale-snapshot",
+            "url", root_url,
+            "message", "Catalog reload was incomplete; using the last complete catalog snapshot.",
+            "error", message
+        )
     }
 
     _Install(target, options, callbacks, archive_only := false) {
@@ -244,13 +369,63 @@ class RimeDepotService {
         return result
     }
 
-    _CatalogDone(job, refresh, catalog, error, warnings) {
+    _CatalogDone(job, refresh, cache, root_url, version_sha, probe_response, prior_snapshot,
+        catalog, error, warnings) {
+        local warning, document, eligible, has_warnings, warning_cause
         if job.IsDone() {
             return
         }
         if error {
+            if prior_snapshot {
+                this._CompleteSnapshotJob(job, prior_snapshot, this._SnapshotLoadWarning(root_url, error))
+                return
+            }
             job.Fail(error)
             return
+        }
+        has_warnings := false
+        warning_cause := 0
+        if warnings is Array && warnings.Length > 0 {
+            has_warnings := true
+            warning_cause := warnings[1]
+        }
+        if catalog.Warnings is Array && catalog.Warnings.Length > 0 {
+            has_warnings := true
+            if !warning_cause {
+                warning_cause := catalog.Warnings[1]
+            }
+        }
+        ; A full load with any stale/error warning is not a coherent new
+        ; generation.  Return the previous normalized generation when one is
+        ; available, and leave its metadata pointer untouched.
+        if has_warnings {
+            if prior_snapshot {
+                this._CompleteSnapshotJob(job, prior_snapshot,
+                    this._SnapshotLoadWarning(root_url, warning_cause))
+                return
+            }
+            this.Catalog := catalog
+            job.Complete(catalog)
+            return
+        }
+        if !refresh && version_sha != "" {
+            document := catalog.ToSnapshot(root_url)
+            eligible := RimeDepotRppiVersionProbe.IsUniformSourceSet(root_url, catalog.Sources)
+            try {
+                cache.WriteSnapshot(root_url, document, version_sha, probe_response, eligible)
+            } catch as err {
+                warning := Map(
+                    "kind", "snapshot",
+                    "url", root_url,
+                    "message", "Catalog loaded but its normalized snapshot could not be committed.",
+                    "error", err.Message
+                )
+                if prior_snapshot {
+                    this._CompleteSnapshotJob(job, prior_snapshot, warning)
+                    return
+                }
+                catalog.Warnings.Push(warning)
+            }
         }
         this.Catalog := catalog
         job.Complete(catalog)

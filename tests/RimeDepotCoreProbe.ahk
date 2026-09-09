@@ -29,6 +29,9 @@ RimeDepotCoreProbeMain() {
     RimeDepotCoreProbeTest("config precedence", RimeDepotCoreProbeConfig.Bind())
     RimeDepotCoreProbeTest("GUI settings INI round-trip", RimeDepotCoreProbeGuiSettings.Bind())
     RimeDepotCoreProbeTest("catalog async and cache fallback", RimeDepotCoreProbeCatalog.Bind())
+    RimeDepotCoreProbeTest("normalized catalog snapshot and commit gate", RimeDepotCoreProbeSnapshotGate.Bind())
+    RimeDepotCoreProbeTest("raw GitHub commit probe URL safety", RimeDepotCoreProbeSnapshotProbeMatrix.Bind())
+    RimeDepotCoreProbeTest("RPPI synchronous request token", RimeDepotCoreProbeRppiSyncRequest.Bind())
     RimeDepotCoreProbeTest("official RPPI categories and recipes", RimeDepotCoreProbeOfficialRppi.Bind())
     RimeDepotCoreProbeTest("git safety", RimeDepotCoreProbeGit.Bind())
     RimeDepotCoreProbeTest("git argv quoting", RimeDepotCoreProbeGitQuoting.Bind())
@@ -385,6 +388,298 @@ RimeDepotCoreProbeCatalog() {
     } finally {
         if DirExist(cache_path) {
             RimeDepotUtil.DeleteTree(cache_path)
+        }
+    }
+}
+
+RimeDepotCoreProbeSnapshotGate() {
+    local cache_path, root_url, child_url, sha_one, sha_two, root_body, child_body
+    local api_url, transport, service, job, snapshot, second_transport, second_service, second_job
+    local failure_transport, failure_service, failure_job, changed_transport, changed_service, changed_job
+    local refresh_transport, refresh_service, refresh_job, forty_root, forty_transport, forty_service, forty_job
+    local calls, warning_count, entry, observer
+    cache_path := A_Temp . "\\RimeDepotCoreProbe-snapshot-" . A_TickCount
+    root_url := "https://raw.githubusercontent.com/rime/rppi/HEAD/index.json"
+    child_url := "https://raw.githubusercontent.com/rime/rppi/HEAD/child/index.json"
+    api_url := "https://api.github.com/repos/rime/rppi/commits?per_page=1"
+    sha_one := "0123456789abcdef0123456789abcdef01234567"
+    sha_two := "fedcba9876543210fedcba9876543210fedcba98"
+    root_body := '{"entries":{"foo":{"repo":"owner/foo","dependencies":["bar"]},"bar":{"repo":"owner/bar"}},"indexes":["child/index.json"]}'
+    child_body := '{"entries":{"child":{"repo":"owner/child"}}}'
+    try {
+        transport := RimeDepotCoreProbeSnapshotTransport(Map(
+            api_url, [RimeDepotHttpResponse(api_url, 200, '[{"sha":"' . sha_one . '"}]', Map("ETag", "api-v1"))],
+            root_url, [RimeDepotHttpResponse(root_url, 200, root_body, Map("ETag", "raw-v1"))],
+            child_url, [RimeDepotHttpResponse(child_url, 200, child_body, Map("ETag", "child-v1"))]
+        ))
+        service := RimeDepotService(Map("CachePath", cache_path, "RppiIndexUrl", root_url,
+            "Proxy", "http://proxy.invalid:7890"), "", Map("Http", transport))
+        observer := RimeDepotCoreProbeSnapshotObserver()
+        job := service.LoadCatalog(RimeDepotCoreProbeCallbacks(
+            ObjBindMethod(observer, "Progress"), ObjBindMethod(observer, "Complete"), ObjBindMethod(observer, "Error")))
+        RimeDepotCoreProbeWait(job)
+        RimeDepotCoreProbeAssert(job.Status = "completed" && observer.CompleteCalls = 1 && observer.ErrorCalls = 0,
+            "Initial official raw catalog load did not complete exactly once.")
+        RimeDepotCoreProbeAssert(transport.Calls.Length = 3 && transport.Calls[1]["Url"] = api_url
+            && transport.Calls[2]["Url"] = root_url && transport.Calls[3]["Url"] = child_url,
+            "Initial commit gate did not issue exactly one API probe followed by raw source loads.")
+        RimeDepotCoreProbeAssert(transport.Calls[1]["Options"]["Proxy"] = "http://proxy.invalid:7890"
+            && transport.Calls[1]["Options"]["Headers"]["Accept"] = "application/vnd.github+json"
+            && transport.Calls[1]["Options"]["Headers"]["X-GitHub-Api-Version"] = "2022-11-28"
+            && transport.Calls[1]["Options"]["Headers"]["User-Agent"] = "RimeDepot",
+            "Commit probe did not preserve proxy or required GitHub headers.")
+        snapshot := RimeDepotRppiCache(cache_path).ReadSnapshot(root_url)
+        RimeDepotCoreProbeAssert(snapshot && snapshot["VersionSha"] = sha_one && snapshot["Eligible"]
+            && snapshot["Metadata"]["complete"] = true,
+            "Initial normalized catalog snapshot was not committed as a complete eligible generation.")
+        entry := service.GetEntry("bar")
+        RimeDepotCoreProbeAssert(entry.ReverseDependencies.Length = 1 && entry.ReverseDependencies[1] = "foo",
+            "Initial catalog reverse dependencies were not derived.")
+
+        second_transport := RimeDepotCoreProbeSnapshotTransport(Map(
+            api_url, [RimeDepotHttpResponse(api_url, 304, "", Map("ETag", "api-v1"))]
+        ))
+        second_service := RimeDepotService(Map("CachePath", cache_path, "RppiIndexUrl", root_url), "",
+            Map("Http", second_transport))
+        second_job := second_service.LoadCatalog()
+        RimeDepotCoreProbeWait(second_job)
+        RimeDepotCoreProbeAssert(second_job.Status = "completed" && second_transport.Calls.Length = 1
+            && second_transport.Calls[1]["Url"] = api_url,
+            "Same-SHA LoadCatalog did not use one API probe and zero raw source requests.")
+        RimeDepotCoreProbeAssert(second_transport.Calls[1]["Options"]["Headers"]["If-None-Match"] = "api-v1",
+            "Commit probe did not send the cached API ETag.")
+        RimeDepotCoreProbeAssert(second_service.GetEntry("bar").ReverseDependencies.Length = 1,
+            "Snapshot restore did not rebuild reverse dependencies.")
+
+        failure_transport := RimeDepotCoreProbeSnapshotTransport(Map(
+            api_url, [RimeDepotHttpResponse(api_url, 503, '{"message":"offline"}', Map())]
+        ))
+        failure_service := RimeDepotService(Map("CachePath", cache_path, "RppiIndexUrl", root_url), "",
+            Map("Http", failure_transport))
+        failure_job := failure_service.LoadCatalog()
+        RimeDepotCoreProbeWait(failure_job)
+        warning_count := failure_service.Catalog.Warnings.Length
+        RimeDepotCoreProbeAssert(failure_job.Status = "completed" && failure_transport.Calls.Length = 1
+            && warning_count > 0 && failure_service.GetEntry("foo").Dependencies.Length = 1,
+            "API failure did not restore the valid snapshot with a warning.")
+        RimeDepotCoreProbeAssert(RimeDepotRppiCache(cache_path).ReadSnapshot(root_url)["VersionSha"] = sha_one,
+            "API failure changed the last complete snapshot.")
+
+        changed_transport := RimeDepotCoreProbeSnapshotTransport(Map(
+            api_url, [RimeDepotHttpResponse(api_url, 200, '[{"sha":"' . sha_two . '"}]', Map("ETag", "api-v2"))],
+            root_url, [RimeDepotHttpResponse(root_url, 200, StrReplace(root_body, "owner/foo", "owner/foo-v2"), Map())],
+            child_url, [RimeDepotHttpResponse(child_url, 200, child_body, Map())]
+        ))
+        changed_service := RimeDepotService(Map("CachePath", cache_path, "RppiIndexUrl", root_url), "",
+            Map("Http", changed_transport))
+        changed_job := changed_service.LoadCatalog()
+        RimeDepotCoreProbeWait(changed_job)
+        RimeDepotCoreProbeAssert(changed_job.Status = "completed" && changed_transport.Calls.Length = 3
+            && RimeDepotRppiCache(cache_path).ReadSnapshot(root_url)["VersionSha"] = sha_two
+            && changed_service.GetEntry("foo").Repo = "owner/foo-v2",
+            "Changed commit SHA did not trigger a complete reload and new snapshot.")
+
+        refresh_transport := RimeDepotCoreProbeSnapshotTransport(Map(
+            root_url, [RimeDepotHttpResponse(root_url, 200, root_body, Map())],
+            child_url, [RimeDepotHttpResponse(child_url, 200, child_body, Map())]
+        ))
+        refresh_service := RimeDepotService(Map("CachePath", cache_path, "RppiIndexUrl", root_url), "",
+            Map("Http", refresh_transport))
+        refresh_job := refresh_service.RefreshCatalog()
+        RimeDepotCoreProbeWait(refresh_job)
+        RimeDepotCoreProbeAssert(refresh_job.Status = "completed" && refresh_transport.Calls.Length = 2
+            && refresh_transport.Calls[1]["Url"] = root_url && refresh_transport.Calls[2]["Url"] = child_url,
+            "RefreshCatalog did not perform a complete raw source load without an API probe.")
+
+        forty_root := "https://raw.githubusercontent.com/rime/rppi/" . sha_one . "/index.json"
+        forty_transport := RimeDepotCoreProbeSnapshotTransport(Map(
+            forty_root, [RimeDepotHttpResponse(forty_root, 200, '{"entries":{"fixed":{"repo":"owner/fixed"}}}', Map())]
+        ))
+        forty_service := RimeDepotService(Map("CachePath", cache_path, "RppiIndexUrl", forty_root), "",
+            Map("Http", forty_transport))
+        forty_job := forty_service.LoadCatalog()
+        RimeDepotCoreProbeWait(forty_job)
+        RimeDepotCoreProbeAssert(forty_job.Status = "completed" && forty_transport.Calls.Length = 1
+            && forty_transport.Calls[1]["Url"] = forty_root,
+            "A 40-hex raw ref unexpectedly made a commit API request.")
+    } finally {
+        if DirExist(cache_path) {
+            try RimeDepotUtil.DeleteTree(cache_path)
+        }
+    }
+}
+
+RimeDepotCoreProbeSnapshotProbeMatrix() {
+    local identity, named, slash, sha, cache_path, root_url, child_url, api_url, root_body, child_body
+    local transport, service, job, snapshot, failing_cache, changed_transport, changed_service, changed_job
+    local raw_paths, snapshot_paths, snapshot_metadata, second_transport, second_service, second_job
+    local forty_root, forty_transport, forty_service
+    local forty_job, forty_second_transport, forty_second_service, forty_second_job
+    local invalid_document, invalid_entry, rejected
+    sha := "0123456789abcdef0123456789abcdef01234567"
+    identity := RimeDepotRppiVersionProbe.ParseRawGithubUrl(
+        "https://raw.githubusercontent.com/rime/rppi/HEAD/index.json")
+    RimeDepotCoreProbeAssert(identity && identity["owner"] = "rime" && identity["repo"] = "rppi"
+        && identity["ref"] = "HEAD" && RimeDepotRppiVersionProbe.BuildApiUrl(identity)
+            = "https://api.github.com/repos/rime/rppi/commits?per_page=1",
+        "HEAD raw URL was not mapped to the default-branch commit endpoint.")
+    named := RimeDepotRppiVersionProbe.ParseRawGithubUrl(
+        "https://raw.githubusercontent.com/rime/rppi/release-candidate/index.json")
+    RimeDepotCoreProbeAssert(named && RimeDepotRppiVersionProbe.BuildApiUrl(named)
+        = "https://api.github.com/repos/rime/rppi/commits/release-candidate",
+        "Named raw ref was not mapped to one encoded commit endpoint.")
+    slash := Map("owner", "rime", "repo", "rppi", "ref", "feature/release")
+    RimeDepotCoreProbeAssert(RimeDepotRppiVersionProbe.BuildApiUrl(slash)
+        = "https://api.github.com/repos/rime/rppi/commits/feature%2Frelease",
+        "Slash-bearing API ref was not encoded as one path segment.")
+    RimeDepotCoreProbeAssert(!RimeDepotRppiVersionProbe.ParseRawGithubUrl(
+        "http://raw.githubusercontent.com/rime/rppi/HEAD/index.json")
+        && !RimeDepotRppiVersionProbe.ParseRawGithubUrl(
+            "https://raw.githubusercontent.com/rime/rppi/HEAD/index.json?x=1")
+        && !RimeDepotRppiVersionProbe.ParseRawGithubUrl(
+            "https://raw.githubusercontent.com/rime/rppi/HEAD/../index.json")
+        && !RimeDepotRppiVersionProbe.ParseRawGithubUrl(
+            "https://raw.githubusercontent.com/rime/rppi/HEAD/%69ndex.json")
+        && !RimeDepotRppiVersionProbe.ParseRawGithubUrl(
+            "https://raw.githubusercontent.com/rime/rppi/HEAD/index" . Chr(92) . "child.json"),
+        "Unsafe or non-exact raw URLs were accepted by the commit gate.")
+    RimeDepotCoreProbeAssert(RimeDepotRppiVersionProbe.IsFullSha(sha)
+        && !RimeDepotRppiVersionProbe.IsFullSha(SubStr(sha, 1, 39)),
+        "Commit gate did not distinguish an immutable full SHA from a short ref.")
+
+    cache_path := A_Temp . "\\RimeDepotCoreProbe-snapshot-boundaries-" . A_TickCount
+    root_url := "https://raw.githubusercontent.com/rime/rppi/HEAD/index.json"
+    child_url := "https://raw.githubusercontent.com/rime/rppi/HEAD/child/index.json"
+    api_url := "https://api.github.com/repos/rime/rppi/commits?per_page=1"
+    root_body := '{"entries":{"foo":{"repo":"owner/foo","dependencies":["bar"]},"bar":{"repo":"owner/bar"}},"indexes":["child/index.json"]}'
+    child_body := '{"entries":{"child":{"repo":"owner/child"}}}'
+    try {
+        transport := RimeDepotCoreProbeSnapshotTransport(Map(
+            api_url, [RimeDepotHttpResponse(api_url, 200, '[{"sha":"' . sha . '"}]')],
+            root_url, [RimeDepotHttpResponse(root_url, 200, root_body)],
+            child_url, [RimeDepotHttpResponse(child_url, 200, child_body)]
+        ))
+        service := RimeDepotService(Map("CachePath", cache_path, "RppiIndexUrl", root_url), "",
+            Map("Http", transport))
+        job := service.LoadCatalog()
+        RimeDepotCoreProbeWait(job)
+        snapshot := RimeDepotRppiCache(cache_path).ReadSnapshot(root_url)
+        RimeDepotCoreProbeAssert(job.Status = "completed" && snapshot && snapshot["Eligible"],
+            "Snapshot boundary fixture did not create a valid snapshot.")
+        snapshot_paths := RimeDepotRppiCache(cache_path)._SnapshotPaths(root_url)
+        snapshot_metadata := snapshot["Metadata"]
+        snapshot_metadata["complete"] := false
+        RimeDepotUtil.AtomicWrite(snapshot_paths.Meta, RimeDepotJson.Stringify(snapshot_metadata))
+        RimeDepotCoreProbeAssert(!RimeDepotRppiCache(cache_path).ReadSnapshot(root_url),
+            "An incomplete normalized snapshot pointer was accepted.")
+        snapshot_metadata["complete"] := true
+        RimeDepotUtil.AtomicWrite(snapshot_paths.Meta, RimeDepotJson.Stringify(snapshot_metadata))
+        snapshot := RimeDepotRppiCache(cache_path).ReadSnapshot(root_url)
+        RimeDepotCoreProbeAssert(snapshot, "The complete normalized snapshot was not restored after the strict-marker check.")
+
+        ; A body can have valid JSON, hashes, and generation paths while its
+        ; dependency graph is still unusable.  Semantic validation must reject
+        ; that generation before it can replace the committed pointer.
+        invalid_document := RimeDepotJson.Parse(RimeDepotJson.Stringify(snapshot["Document"]))
+        for _, invalid_entry in invalid_document["entries"] {
+            if RimeDepotUtil.GetString(invalid_entry, ["id"], "") = "foo" {
+                invalid_entry["dependencies"] := ["missing"]
+                break
+            }
+        }
+        rejected := false
+        try {
+            RimeDepotRppiCache(cache_path).WriteSnapshot(root_url, invalid_document, sha)
+        } catch as err {
+            rejected := true
+        }
+        RimeDepotCoreProbeAssert(rejected
+            && RimeDepotRppiCache(cache_path).ReadSnapshot(root_url)["VersionSha"] = sha,
+            "A semantically invalid snapshot was accepted or replaced the valid generation.")
+
+        failing_cache := RimeDepotRppiCache(cache_path, RimeDepotCoreProbeCacheWriter())
+        try {
+            failing_cache.WriteSnapshot(root_url, snapshot["Document"],
+                "fedcba9876543210fedcba9876543210fedcba98")
+            throw Error("Expected snapshot metadata commit failure was not raised.")
+        } catch as err {
+            if InStr(err.Message, "Expected snapshot metadata") {
+                throw err
+            }
+        }
+        RimeDepotCoreProbeAssert(RimeDepotRppiCache(cache_path).ReadSnapshot(root_url)["VersionSha"] = sha,
+            "A failed snapshot generation replaced the previous complete pointer.")
+
+        ; Remove only the raw generation files.  The complete normalized
+        ; snapshot must still be preserved if a changed revision cannot reload.
+        raw_paths := RimeDepotRppiCache(cache_path)._Paths(root_url)
+        if FileExist(raw_paths.Meta) {
+            FileDelete(raw_paths.Meta)
+        }
+        if FileExist(raw_paths.Body) {
+            FileDelete(raw_paths.Body)
+        }
+        changed_transport := RimeDepotCoreProbeSnapshotTransport(Map(
+            api_url, [RimeDepotHttpResponse(api_url, 200,
+                '[{"sha":"fedcba9876543210fedcba9876543210fedcba98"}]')],
+            root_url, [RimeDepotHttpResponse(root_url, 503, "", Map())]
+        ))
+        changed_service := RimeDepotService(Map("CachePath", cache_path, "RppiIndexUrl", root_url), "",
+            Map("Http", changed_transport))
+        changed_job := changed_service.LoadCatalog()
+        RimeDepotCoreProbeWait(changed_job)
+        RimeDepotCoreProbeAssert(changed_job.Status = "completed"
+            && changed_service.Catalog.Warnings.Length > 0
+            && changed_service.GetEntry("foo").Repo = "owner/foo"
+            && RimeDepotRppiCache(cache_path).ReadSnapshot(root_url)["VersionSha"] = sha,
+            "A failed changed-revision reload did not complete from the old snapshot with a warning.")
+
+        forty_root := "https://raw.githubusercontent.com/rime/rppi/" . sha . "/index.json"
+        forty_transport := RimeDepotCoreProbeSnapshotTransport(Map(
+            forty_root, [RimeDepotHttpResponse(forty_root, 200, '{"entries":{"fixed":{"repo":"owner/fixed"}}}')]
+        ))
+        forty_service := RimeDepotService(Map("CachePath", cache_path, "RppiIndexUrl", forty_root), "",
+            Map("Http", forty_transport))
+        forty_job := forty_service.LoadCatalog()
+        RimeDepotCoreProbeWait(forty_job)
+        forty_second_transport := RimeDepotCoreProbeSnapshotTransport(Map())
+        forty_second_service := RimeDepotService(Map("CachePath", cache_path, "RppiIndexUrl", forty_root), "",
+            Map("Http", forty_second_transport))
+        forty_second_job := forty_second_service.LoadCatalog()
+        RimeDepotCoreProbeWait(forty_second_job)
+        RimeDepotCoreProbeAssert(forty_job.Status = "completed" && forty_second_job.Status = "completed"
+            && forty_transport.Calls.Length = 1 && forty_second_transport.Calls.Length = 0
+            && forty_second_service.GetEntry("fixed").Repo = "owner/fixed",
+            "An immutable raw SHA did not enable a zero-request snapshot restore.")
+    } finally {
+        if DirExist(cache_path) {
+            try RimeDepotUtil.DeleteTree(cache_path)
+        }
+    }
+}
+
+RimeDepotCoreProbeRppiSyncRequest() {
+    local cache_path, root_url, response, transport, job, observer, operation
+    cache_path := A_Temp . "\\RimeDepotCoreProbe-rppi-sync-" . A_TickCount
+    root_url := "https://example.invalid/synchronous-index.json"
+    response := RimeDepotHttpResponse(root_url, 200,
+        '{"entries":{"sync":{"repo":"owner/sync"}}}', Map())
+    transport := RimeDepotCoreProbeSyncTransport(Map(root_url, response))
+    try {
+        job := RimeDepotJob("sync-rppi")
+        job.Start()
+        observer := RimeDepotCoreProbeSnapshotObserver()
+        operation := RimeDepotRppiLoadOperation(transport, RimeDepotRppiCache(cache_path), root_url,
+            Map(), job, ObjBindMethod(observer, "Operation"))
+        operation.Start()
+        RimeDepotCoreProbeWaitSignal(observer)
+        RimeDepotCoreProbeAssert(observer.OperationCalls = 1 && !observer.OperationError
+            && operation.ActiveToken = 0 && !operation.ActiveRequest
+            && transport.Calls.Length = 1 && transport.LastRequest && transport.LastRequest.CancelCalls = 0,
+            "Synchronous or duplicate RPPI callbacks left a stale request handle or completed twice.")
+    } finally {
+        if DirExist(cache_path) {
+            try RimeDepotUtil.DeleteTree(cache_path)
         }
     }
 }
@@ -1216,6 +1511,75 @@ class RimeDepotCoreProbeTransport {
     }
 }
 
+class RimeDepotCoreProbeSnapshotTransport {
+    __New(responses) {
+        this.Responses := responses
+        this.Calls := []
+    }
+
+    Get(url, options := 0, job := 0) {
+        local response, queue, headers, copied
+        headers := Map()
+        if IsObject(options) {
+            copied := RimeDepotUtil.GetValue(options, ["Headers", "headers"], 0)
+            if IsObject(copied) {
+                for key, value in copied {
+                    headers[key] := value
+                }
+            }
+        }
+        this.Calls.Push(Map("Url", url, "Options", options, "Headers", headers))
+        if !this.Responses.Has(url) {
+            return RimeDepotHttpResponse(url, 404, "", Map())
+        }
+        queue := this.Responses[url]
+        if !(queue is Array) || queue.Length = 0 {
+            return RimeDepotHttpResponse(url, 404, "", Map())
+        }
+        response := queue.Length > 1 ? queue.RemoveAt(1) : queue[1]
+        return RimeDepotHttpResponse(response.Url, response.Status, response.Body, response.Headers, response.Error)
+    }
+}
+
+class RimeDepotCoreProbeSyncRequest {
+    __New() {
+        this.CancelCalls := 0
+    }
+
+    Cancel() {
+        this.CancelCalls += 1
+        return true
+    }
+}
+
+class RimeDepotCoreProbeSyncTransport {
+    __New(responses) {
+        this.Responses := responses
+        this.Calls := []
+        this.LastRequest := 0
+    }
+
+    GetAsync(url, callback, options := 0, job := 0) {
+        local response, request
+        this.Calls.Push(url)
+        if this.Responses.Has(url) {
+            response := this.Responses[url]
+            response := RimeDepotHttpResponse(response.Url, response.Status, response.Body,
+                response.Headers, response.Error)
+        } else {
+            response := RimeDepotHttpResponse(url, 404, "", Map())
+        }
+        ; Deliberately deliver twice before returning the request handle.  The
+        ; loader must accept only the first response and must not retain this
+        ; already-completed handle for later cancellation.
+        callback.Call(response)
+        callback.Call(response)
+        request := RimeDepotCoreProbeSyncRequest()
+        this.LastRequest := request
+        return request
+    }
+}
+
 class RimeDepotCoreProbeOutcome {
     __New() {
         this.Done := false
@@ -1254,6 +1618,35 @@ class RimeDepotCoreProbeOutcome {
         this.Done := true
         this.Success := response && response.Ok()
         this.Value := response
+    }
+}
+
+class RimeDepotCoreProbeSnapshotObserver {
+    __New() {
+        this.ProgressCalls := 0
+        this.CompleteCalls := 0
+        this.ErrorCalls := 0
+        this.Done := false
+        this.OperationCalls := 0
+        this.OperationError := 0
+    }
+
+    Progress(job, value) {
+        this.ProgressCalls += 1
+    }
+
+    Complete(job, value) {
+        this.CompleteCalls += 1
+    }
+
+    Error(job, value) {
+        this.ErrorCalls += 1
+    }
+
+    Operation(catalog, error, warnings) {
+        this.OperationCalls += 1
+        this.OperationError := error
+        this.Done := true
     }
 }
 

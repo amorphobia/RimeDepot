@@ -127,6 +127,52 @@ class RimeDepotCatalog {
         return result
     }
 
+    /** Serialize only the normalized catalog state needed for a safe snapshot. */
+    ToSnapshot(root_url) {
+        local entries, entry, item
+        entries := []
+        for _, entry in this.Entries {
+            item := entry.ToMap()
+            ; Raw is the original parser object and is not part of the
+            ; normalized restore contract.  Excluding it also prevents an
+            ; arbitrary extension object from becoming snapshot data.
+            if item.Has("raw") {
+                item.Delete("raw")
+            }
+            entries.Push(item)
+        }
+        return Map(
+            "schema", RimeDepotRppiCache.SNAPSHOT_SCHEMA,
+            "rootUrl", root_url,
+            "sources", this.Sources.Clone(),
+            "entries", entries
+        )
+    }
+
+    /** Restore a snapshot and rebuild dependency-derived reverse links. */
+    static FromSnapshot(document) {
+        local catalog, item, entry
+        if !IsObject(document) || !document.Has("entries") || !(document["entries"] is Array) {
+            throw RimeDepotCatalogError("Catalog snapshot has no entries array.")
+        }
+        catalog := RimeDepotCatalog()
+        for _, item in document["entries"] {
+            if !IsObject(item) {
+                throw RimeDepotCatalogError("Catalog snapshot contains a non-object entry.")
+            }
+            entry := RimeDepotCatalogEntry(item, RimeDepotUtil.GetString(item, ["id", "Id", "key"], ""))
+            ; Reverse dependencies are derived from the complete set and must
+            ; not be trusted as independently persisted graph state.
+            entry.ReverseDependencies := []
+            catalog.Add(entry, entry.Id)
+        }
+        if document.Has("sources") && document["sources"] is Array {
+            catalog.Sources := document["sources"].Clone()
+        }
+        catalog.Validate()
+        return catalog
+    }
+
     static DependencyValue(value) {
         if !IsObject(value) {
             return String(value)
@@ -184,6 +230,8 @@ class RimeDepotCatalog {
 }
 
 class RimeDepotRppiCache {
+    static SNAPSHOT_SCHEMA := "rime-depot-catalog-snapshot-v1"
+
     __New(cache_path, atomic_writer := 0) {
         this.Root := RimeDepotUtil.JoinPath(cache_path, "rppi")
         this.AtomicWriter := atomic_writer
@@ -280,6 +328,200 @@ class RimeDepotRppiCache {
         return this.Read(url)
     }
 
+    /** Read a complete, generation-validated normalized catalog snapshot. */
+    ReadSnapshot(root_url) {
+        local paths, metadata, body_file, generation, body_path, body_hash, body, document
+        local sources, source_hash, snapshot, version_sha, complete
+        paths := this._SnapshotPaths(root_url)
+        if !FileExist(paths.Meta) {
+            return 0
+        }
+        try {
+            metadata := RimeDepotJson.Parse(FileRead(paths.Meta, "UTF-8"))
+            if RimeDepotUtil.GetString(metadata, ["schema"], "") != RimeDepotRppiCache.SNAPSHOT_SCHEMA
+                || RimeDepotUtil.GetString(metadata, ["rootUrl", "root_url"], "") != root_url {
+                return 0
+            }
+            complete := RimeDepotUtil.GetValue(metadata, ["complete"], false)
+            if complete != true {
+                return 0
+            }
+            body_hash := RimeDepotUtil.GetString(metadata, ["bodyHash", "body_hash"], "")
+            generation := RimeDepotUtil.GetString(metadata, ["generation"], "")
+            body_file := RimeDepotUtil.GetString(metadata, ["BodyFile", "body_file"], "")
+            if body_hash = "" || generation = "" || body_file = "" {
+                return 0
+            }
+            body_path := this._SnapshotBodyPath(root_url, body_file, generation)
+            if !body_path || !FileExist(body_path) {
+                return 0
+            }
+            body := FileRead(body_path, "UTF-8")
+            if RimeDepotRppiCache.Hash(body) != body_hash {
+                return 0
+            }
+            document := RimeDepotJson.Parse(body)
+            this._ValidateSnapshotDocument(document, root_url)
+            ; Structural and hash checks are not enough: a normalized body must
+            ; also describe a closed, acyclic dependency graph before it can
+            ; become fallback catalog state.
+            RimeDepotCatalog.FromSnapshot(document)
+            sources := document["sources"]
+            source_hash := RimeDepotRppiCache.Hash(RimeDepotJson.Stringify(sources))
+            if RimeDepotUtil.GetString(metadata, ["sourceHash", "source_hash"], "") != source_hash {
+                return 0
+            }
+            version_sha := StrLower(RimeDepotUtil.GetString(metadata, ["versionSha", "version_sha"], ""))
+            if !RimeDepotRppiVersionProbe.IsFullSha(version_sha) {
+                return 0
+            }
+            snapshot := Map(
+                "Document", document,
+                "Metadata", metadata,
+                "VersionSha", version_sha,
+                "ProbeETag", RimeDepotUtil.GetString(metadata, ["probeEtag", "probe_etag"], ""),
+                "ProbeLastModified", RimeDepotUtil.GetString(
+                    metadata, ["probeLastModified", "probe_last_modified"], ""),
+                "CheckedAt", RimeDepotUtil.GetString(metadata, ["checkedAt", "checked_at"], ""),
+                "StoredAt", RimeDepotUtil.GetString(metadata, ["storedAt", "stored_at"], ""),
+                "Eligible", !!RimeDepotUtil.GetValue(metadata, ["eligible"], false)
+            )
+            return snapshot
+        } catch {
+            ; A partial snapshot must never be allowed to become catalog state.
+            return 0
+        }
+    }
+
+    /**
+     * Commit a normalized snapshot body before replacing its metadata pointer.
+     * The old generation remains authoritative if either write fails.
+     */
+    WriteSnapshot(root_url, document, version_sha, probe_response := 0, eligible := false) {
+        local paths, old_metadata, old_body_file, old_generation, generation, body_file, body_path
+        local body, metadata, old_body_path, sources, source_hash, probe_etag, probe_last_modified
+        if document is RimeDepotCatalog {
+            document := document.ToSnapshot(root_url)
+        }
+        this._ValidateSnapshotDocument(document, root_url)
+        ; Reject semantically invalid generations before writing either the
+        ; body or its metadata pointer.
+        RimeDepotCatalog.FromSnapshot(document)
+        version_sha := StrLower(String(version_sha))
+        if !(version_sha ~= "i)^[0-9a-f]{40}$") {
+            throw RimeDepotCatalogError("Catalog snapshot requires a full commit SHA.")
+        }
+        body := RimeDepotJson.Stringify(document)
+        paths := this._SnapshotPaths(root_url)
+        old_body_file := ""
+        old_generation := ""
+        if FileExist(paths.Meta) {
+            try {
+                old_metadata := RimeDepotJson.Parse(FileRead(paths.Meta, "UTF-8"))
+                old_body_file := RimeDepotUtil.GetString(old_metadata, ["BodyFile", "body_file"], "")
+                old_generation := RimeDepotUtil.GetString(old_metadata, ["generation"], "")
+            }
+        }
+        generation := RimeDepotUtil.NextId()
+        body_file := paths.Prefix . generation . ".json"
+        body_path := RimeDepotUtil.JoinPath(this.Root, body_file)
+        sources := document["sources"]
+        source_hash := RimeDepotRppiCache.Hash(RimeDepotJson.Stringify(sources))
+        probe_etag := probe_response && HasProp(probe_response, "ETag") ? probe_response.ETag : ""
+        probe_last_modified := probe_response && HasProp(probe_response, "LastModified")
+            ? probe_response.LastModified : ""
+        metadata := RimeDepotJson.Stringify(Map(
+            "schema", RimeDepotRppiCache.SNAPSHOT_SCHEMA,
+            "rootUrl", root_url,
+            "versionSha", version_sha,
+            "probeEtag", probe_etag,
+            "probeLastModified", probe_last_modified,
+            "checkedAt", probe_response ? A_NowUTC : "",
+            "storedAt", A_NowUTC,
+            "generation", generation,
+            "bodyHash", RimeDepotRppiCache.Hash(body),
+            "sourceHash", source_hash,
+            "eligible", !!eligible,
+            "complete", true,
+            "BodyFile", body_file
+        ))
+        this._AtomicWrite(body_path, body)
+        this._AtomicWrite(paths.Meta, metadata)
+        old_body_path := this._SnapshotBodyPath(root_url, old_body_file, old_generation)
+        if old_body_path && old_body_path != body_path {
+            try FileDelete(old_body_path)
+        }
+        return this.ReadSnapshot(root_url)
+    }
+
+    /** Update probe validators without rewriting the committed body. */
+    TouchSnapshot(root_url, snapshot, version_sha := "", probe_response := 0) {
+        local paths, metadata, source_metadata, body_file, generation, probe_etag, probe_last_modified, key, value
+        if !snapshot || !IsObject(snapshot["Metadata"]) {
+            return false
+        }
+        paths := this._SnapshotPaths(root_url)
+        try {
+            source_metadata := snapshot["Metadata"]
+            metadata := Map()
+            for key, value in source_metadata {
+                metadata[key] := value
+            }
+            body_file := RimeDepotUtil.GetString(metadata, ["BodyFile", "body_file"], "")
+            generation := RimeDepotUtil.GetString(metadata, ["generation"], "")
+            if !this._SnapshotBodyPath(root_url, body_file, generation) {
+                return false
+            }
+            if version_sha != "" {
+                version_sha := StrLower(String(version_sha))
+                if !(version_sha ~= "i)^[0-9a-f]{40}$") {
+                    return false
+                }
+                metadata["versionSha"] := version_sha
+            }
+            probe_etag := probe_response && HasProp(probe_response, "ETag") ? probe_response.ETag : ""
+            probe_last_modified := probe_response && HasProp(probe_response, "LastModified")
+                ? probe_response.LastModified : ""
+            if probe_etag != "" {
+                metadata["probeEtag"] := probe_etag
+            }
+            if probe_last_modified != "" {
+                metadata["probeLastModified"] := probe_last_modified
+            }
+            metadata["checkedAt"] := A_NowUTC
+            this._AtomicWrite(paths.Meta, RimeDepotJson.Stringify(metadata))
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    _ValidateSnapshotDocument(document, root_url) {
+        local sources, entries, source, entry
+        if !IsObject(document) || RimeDepotUtil.GetString(document, ["schema"], "")
+            != RimeDepotRppiCache.SNAPSHOT_SCHEMA
+            || RimeDepotUtil.GetString(document, ["rootUrl", "root_url"], "") != root_url {
+            throw RimeDepotCatalogError("Catalog snapshot schema or root URL is invalid.")
+        }
+        sources := RimeDepotUtil.GetValue(document, ["sources"], 0)
+        entries := RimeDepotUtil.GetValue(document, ["entries"], 0)
+        if !(sources is Array) || sources.Length = 0 || sources[1] != root_url || !(entries is Array) {
+            throw RimeDepotCatalogError("Catalog snapshot source or entry arrays are invalid.")
+        }
+        for _, source in sources {
+            source := String(source)
+            if !RimeDepotUtil.IsUrl(source) || source ~= "[\x00-\x20\\]" {
+                throw RimeDepotCatalogError("Catalog snapshot contains an unsafe source URL.")
+            }
+        }
+        for _, entry in entries {
+            if !IsObject(entry) || RimeDepotUtil.GetString(entry, ["id", "Id", "key"], "") = "" {
+                throw RimeDepotCatalogError("Catalog snapshot contains an invalid entry.")
+            }
+        }
+        return true
+    }
+
     _Paths(url) {
         key := RimeDepotRppiCache.Hash(url)
         return {
@@ -288,6 +530,34 @@ class RimeDepotRppiCache {
             Body: RimeDepotUtil.JoinPath(this.Root, "index-" . key . ".json"),
             Meta: RimeDepotUtil.JoinPath(this.Root, "index-" . key . ".meta.json")
         }
+    }
+
+    _SnapshotPaths(root_url) {
+        local key
+        key := RimeDepotRppiCache.Hash("snapshot|" . root_url)
+        return {
+            Key: key,
+            Prefix: "snapshot-" . key . "-",
+            Body: RimeDepotUtil.JoinPath(this.Root, "snapshot-" . key . ".json"),
+            Meta: RimeDepotUtil.JoinPath(this.Root, "snapshot-" . key . ".meta.json")
+        }
+    }
+
+    _SnapshotBodyPath(root_url, body_file, generation := "") {
+        local paths := this._SnapshotPaths(root_url)
+        if body_file = "" || body_file ~= "[\\/\r\n]" {
+            return ""
+        }
+        if body_file != RegExReplace(body_file, ".*[\\/]", "") {
+            return ""
+        }
+        if !RegExMatch(body_file, "^" . paths.Prefix . "[A-Za-z0-9-]+\.json$") {
+            return ""
+        }
+        if generation != "" && body_file != paths.Prefix . generation . ".json" {
+            return ""
+        }
+        return RimeDepotUtil.JoinPath(this.Root, body_file)
     }
 
     _BodyPath(url, body_file, generation := "") {
@@ -329,15 +599,267 @@ class RimeDepotRppiCache {
     }
 }
 
+/** One-request commit gate for the official raw GitHub index format. */
+class RimeDepotRppiVersionProbe {
+    __New(client, root_url, options := 0, snapshot := 0, callback := 0, job := 0) {
+        this.Client := client
+        this.RootUrl := root_url
+        this.Options := IsObject(options) ? options : Map()
+        this.Snapshot := snapshot
+        this.Callback := callback
+        this.Job := job
+        this.Identity := 0
+        this.Request := 0
+        this.Done := false
+    }
+
+    Start() {
+        local identity, ref, api_url, headers, snapshot_etag, snapshot_modified, request_options, request
+        identity := RimeDepotRppiVersionProbe.ParseRawGithubUrl(this.RootUrl)
+        if !identity {
+            this._Finish(Map("ok", false, "error", RimeDepotCatalogError(
+                "Commit probing requires an exact raw.githubusercontent.com URL.")))
+            return this
+        }
+        this.Identity := identity
+        ref := identity["ref"]
+        ; A full SHA is already immutable and must not spend an API request.
+        if RimeDepotRppiVersionProbe.IsFullSha(ref) {
+            this._Finish(Map("ok", true, "sha", StrLower(ref), "response", 0, "notModified", false))
+            return this
+        }
+        api_url := RimeDepotRppiVersionProbe.BuildApiUrl(identity)
+        headers := Map(
+            "Accept", "application/vnd.github+json",
+            "X-GitHub-Api-Version", "2022-11-28",
+            "User-Agent", "RimeDepot"
+        )
+        snapshot_etag := this.Snapshot ? RimeDepotUtil.GetString(this.Snapshot, ["ProbeETag"], "") : ""
+        snapshot_modified := this.Snapshot
+            ? RimeDepotUtil.GetString(this.Snapshot, ["ProbeLastModified"], "") : ""
+        if snapshot_etag != "" {
+            headers["If-None-Match"] := snapshot_etag
+        }
+        if snapshot_modified != "" {
+            headers["If-Modified-Since"] := snapshot_modified
+        }
+        request_options := Map(
+            "Proxy", RimeDepotUtil.GetString(this.Options, ["Proxy", "proxy"], ""),
+            "Headers", headers
+        )
+        timeout := RimeDepotUtil.GetValue(this.Options, ["Timeout", "timeout"], 0)
+        if timeout {
+            request_options["Timeout"] := timeout
+        }
+        try {
+            request := this.Client.GetAsync(api_url, ObjBindMethod(this, "_Response"), request_options, this.Job)
+            if this.Done {
+                this.Request := 0
+            } else {
+                this.Request := request
+            }
+        } catch as err {
+            this._Finish(Map("ok", false, "error", err, "response", 0))
+        }
+        return this
+    }
+
+    Cancel(*) {
+        local request
+        if this.Done {
+            return false
+        }
+        this.Done := true
+        request := this.Request
+        this.Request := 0
+        if request && HasMethod(request, "Cancel") {
+            try request.Cancel()
+        }
+        return true
+    }
+
+    _Response(response) {
+        local document, item, sha
+        this.Request := 0
+        if this.Done {
+            return
+        }
+        try {
+            if response && response.Status = 304 {
+                sha := this.Snapshot ? RimeDepotUtil.GetString(this.Snapshot, ["VersionSha"], "") : ""
+                if !RimeDepotRppiVersionProbe.IsFullSha(sha) {
+                    this._Finish(Map("ok", false, "error", RimeDepotCatalogError(
+                        "GitHub returned 304 without a valid cached commit SHA."), "response", response))
+                    return
+                }
+                this._Finish(Map("ok", true, "sha", StrLower(sha), "response", response, "notModified", true))
+                return
+            }
+            if !response || !response.Ok() {
+                this._Finish(Map("ok", false, "error", this._ResponseError(response), "response", response))
+                return
+            }
+            document := RimeDepotJson.Parse(response.Body)
+            item := document is Array ? (document.Length ? document[1] : 0) : document
+            sha := IsObject(item) ? RimeDepotUtil.GetString(item, ["sha", "SHA"], "") : ""
+            if !RimeDepotRppiVersionProbe.IsFullSha(sha) {
+                this._Finish(Map("ok", false, "error", RimeDepotCatalogError(
+                    "GitHub commit probe returned no full 40-character SHA."), "response", response))
+                return
+            }
+            this._Finish(Map("ok", true, "sha", StrLower(sha), "response", response, "notModified", false))
+        } catch as err {
+            this._Finish(Map("ok", false, "error", err, "response", response))
+        }
+    }
+
+    _ResponseError(response) {
+        local status, message, document
+        if response && response.Error {
+            return response.Error
+        }
+        status := response ? response.Status : 0
+        message := "GitHub commit probe failed (HTTP " . status . ")."
+        if response && response.Body != "" {
+            try {
+                document := RimeDepotJson.Parse(response.Body)
+                message := RimeDepotUtil.GetString(document, ["message"], message)
+            }
+        }
+        return RimeDepotCatalogError(message)
+    }
+
+    _Finish(result) {
+        if this.Done {
+            return
+        }
+        this.Done := true
+        if this.Callback {
+            try {
+                this.Callback.Call(result)
+            } catch as err {
+                OutputDebug("RimeDepot commit probe callback failed: " . err.Message)
+            }
+        }
+    }
+
+    static ParseRawGithubUrl(url) {
+        local match, path, part, identity, owner, repo, ref
+        url := String(url)
+        if url = "" || InStr(url, "?") || InStr(url, "#") || InStr(url, Chr(92))
+            || url ~= "[\x00-\x20]" || InStr(url, "%") {
+            return 0
+        }
+        if !RegExMatch(url, "i)^https://raw\.githubusercontent\.com/([^/?#\\\s]+)/([^/?#\\\s]+)/([^/?#\\\s]+)/(.+)$", &match) {
+            return 0
+        }
+        owner := match[1]
+        repo := match[2]
+        ref := match[3]
+        path := match[4]
+        if !(owner ~= "^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+            || !(repo ~= "^[A-Za-z0-9][A-Za-z0-9_.-]*$") {
+            return 0
+        }
+        try RimeDepotUtil.ValidateRef(ref)
+        catch {
+            return 0
+        }
+        for _, part in StrSplit(path, "/") {
+            if part = "" || part = "." || part = ".." || part ~= "[\x00-\x20]" {
+                return 0
+            }
+        }
+        identity := Map("owner", owner, "repo", repo, "ref", ref, "path", path)
+        return identity
+    }
+
+    static IsFullSha(value) {
+        return String(value) ~= "i)^[0-9a-f]{40}$"
+    }
+
+    static IsUniformSourceSet(root_url, sources) {
+        local root, source, identity
+        root := this.ParseRawGithubUrl(root_url)
+        if !root || !(sources is Array) || sources.Length = 0 || sources[1] != root_url {
+            return false
+        }
+        for _, source in sources {
+            identity := this.ParseRawGithubUrl(String(source))
+            if !identity || StrLower(identity["owner"]) != StrLower(root["owner"])
+                || StrLower(identity["repo"]) != StrLower(root["repo"])
+                || identity["ref"] != root["ref"] {
+                return false
+            }
+        }
+        return true
+    }
+
+    static CanFastPath(root_url, identity, snapshot, version_sha) {
+        local document, sources, stored_sha
+        if !snapshot || !IsObject(snapshot) {
+            return false
+        }
+        if !RimeDepotUtil.GetValue(snapshot, ["Eligible"], false) {
+            return false
+        }
+        stored_sha := RimeDepotUtil.GetString(snapshot, ["VersionSha"], "")
+        if !this.IsFullSha(version_sha) || StrLower(stored_sha) != StrLower(version_sha) {
+            return false
+        }
+        document := RimeDepotUtil.GetValue(snapshot, ["Document"], 0)
+        sources := IsObject(document) ? RimeDepotUtil.GetValue(document, ["sources"], 0) : 0
+        return this.IsUniformSourceSet(root_url, sources)
+    }
+
+    static BuildApiUrl(identity) {
+        local owner, repo, ref, base
+        owner := RimeDepotUtil.GetString(identity, ["owner"], "")
+        repo := RimeDepotUtil.GetString(identity, ["repo"], "")
+        ref := RimeDepotUtil.GetString(identity, ["ref"], "")
+        base := "https://api.github.com/repos/" . this.EncodePathSegment(owner) . "/"
+            . this.EncodePathSegment(repo) . "/commits"
+        if ref = "HEAD" {
+            return base . "?per_page=1"
+        }
+        return base . "/" . this.EncodePathSegment(ref)
+    }
+
+    static EncodePathSegment(value) {
+        local byte_count, data, result, byte, char
+        value := String(value)
+        byte_count := StrPut(value, "UTF-8") - 1
+        if byte_count <= 0 {
+            return ""
+        }
+        data := Buffer(byte_count)
+        StrPut(value, data, "UTF-8")
+        result := ""
+        Loop byte_count {
+            byte := NumGet(data, A_Index - 1, "UChar")
+            char := Chr(byte)
+            if byte >= 0x30 && byte <= 0x39 || byte >= 0x41 && byte <= 0x5A
+                || byte >= 0x61 && byte <= 0x7A || InStr("._~-", char) {
+                result .= char
+            } else {
+                result .= "%" . Format("{:02X}", byte)
+            }
+        }
+        return result
+    }
+}
+
 /** Asynchronous loader for one or more linked RPPI index.json documents. */
 class RimeDepotRppiLoadOperation {
-    __New(client, cache, root_url, options, job, callback) {
+    __New(client, cache, root_url, options, job, callback, refresh := false, force_reload := false) {
         this.Client := client
         this.Cache := cache
         this.RootUrl := root_url
         this.Options := IsObject(options) ? options : Map()
         this.Job := job
         this.Callback := callback
+        this.Refresh := !!refresh
+        this.ForceReload := !!force_reload
         ; Keep the category path alongside each URL.  A child index can be
         ; referenced by more than one category, so the first path is retained
         ; for deterministic display and search results.
@@ -346,6 +868,8 @@ class RimeDepotRppiLoadOperation {
         this.Catalog := RimeDepotCatalog()
         this.Warnings := []
         this.ActiveRequest := 0
+        this.ActiveToken := 0
+        this.RequestGeneration := 0
         this.Done := false
         this._step_timer := ObjBindMethod(this, "_Step")
     }
@@ -356,11 +880,17 @@ class RimeDepotRppiLoadOperation {
     }
 
     Cancel(*) {
-        if this.ActiveRequest && HasMethod(this.ActiveRequest, "Cancel") {
-            this.ActiveRequest.Cancel()
-        }
+        request := this.ActiveRequest
+        ; Invalidate the callback before cancelling the transport.  Some fake
+        ; and real transports can report cancellation synchronously.
+        this.ActiveToken := 0
+        this.RequestGeneration += 1
+        this.ActiveRequest := 0
         this.Done := true
         this.Queue := []
+        if request && HasMethod(request, "Cancel") {
+            request.Cancel()
+        }
     }
 
     _Step() {
@@ -391,7 +921,7 @@ class RimeDepotRppiLoadOperation {
     }
 
     _Fetch(url, category_path := "") {
-        cached := this.Cache.Read(url)
+        cached := this.ForceReload ? 0 : this.Cache.Read(url)
         headers := Map()
         if cached {
             if cached.ETag != "" {
@@ -407,15 +937,33 @@ class RimeDepotRppiLoadOperation {
         )
         this.Job.ReportProgress(Map("phase", "catalog", "state", "fetching", "url", url,
             "cached", !!cached))
+        this.RequestGeneration += 1
+        token := this.RequestGeneration
+        this.ActiveToken := token
+        this.ActiveRequest := 0
         try {
-            this.ActiveRequest := this.Client.GetAsync(
-                url, ObjBindMethod(this, "_Response", url, cached, category_path), request_options, this.Job)
+            request := this.Client.GetAsync(
+                url, ObjBindMethod(this, "_Response", token, url, cached, category_path), request_options, this.Job)
+            ; GetAsync may invoke the callback before returning.  Do not keep
+            ; a completed request handle as the next cancel target.
+            if this.ActiveToken = token && !this.Done && !this.Job.IsCancelled() {
+                this.ActiveRequest := request
+            }
         } catch as err {
-            this._Response(url, cached, category_path, RimeDepotHttpResponse(url, 0, "", Map(), err))
+            if this.ActiveToken = token {
+                this._Response(token, url, cached, category_path,
+                    RimeDepotHttpResponse(url, 0, "", Map(), err))
+            }
         }
     }
 
-    _Response(url, cached, category_path, response) {
+    _Response(token, url, cached, category_path, response) {
+        if token != this.ActiveToken {
+            return
+        }
+        ; Clear the token before any parsing, cache write, or callback can
+        ; re-enter this operation.  Duplicate/late responses are ignored.
+        this.ActiveToken := 0
         this.ActiveRequest := 0
         if this.Done || this.Job.IsCancelled() {
             return

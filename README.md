@@ -61,6 +61,19 @@ hash, URL, and cache directory; incomplete or mismatched pairs are rejected.
 A failed refresh can fall back to the last complete generation with a visible
 warning.
 
+For the default `raw.githubusercontent.com` RPPI index, a normal catalog load
+also probes GitHub's commits API and records the resulting full commit SHA in a
+separate generation-backed normalized catalog snapshot. If the SHA is
+unchanged, the complete catalog (including dependency-derived reverse links)
+is restored locally without fetching the root or child indexes. A 40-character
+SHA in the raw URL is already immutable and skips the probe. RefreshCatalog
+always walks every raw index; custom index URLs retain the regular HTTP-cache
+behavior. Snapshot bodies are written before their metadata pointer and are
+accepted only when the root URL, schema, source list, generation path, and
+hashes all validate. Probe failures use a valid prior snapshot with a warning;
+without one, the normal full load remains the fallback. No GitHub token or
+additional INI setting is required.
+
 Installations are staged under the configured cache directory and are limited
 to the configured Rime directory. Relative paths, archive ZIP names, recipe
 globs, and Git refs are validated against traversal, absolute paths, and
